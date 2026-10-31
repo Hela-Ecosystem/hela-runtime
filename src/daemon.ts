@@ -41,7 +41,7 @@ export class HelaRuntime {
 
   constructor() {
     this.root = ecosystemRoot();
-    this.profile = process.env.HELA_PROFILE || null;
+    this.profile = process.env.HELA_PROFILE || 'dev-workspace';
     this.namespaced = process.env.HELA_NAMESPACE_TOOLS === '1';
     this.server = new Server(
       { name: 'hela-runtime', version: VERSION },
