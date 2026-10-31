@@ -44,16 +44,18 @@ export class HelaRuntime {
   private selectedSpecs(): CellSpec[] {
     const invPath = path.join(this.root, 'config', 'inventory.json');
     const inv = JSON.parse(fs.readFileSync(invPath, 'utf8'));
-    const all: CellSpec[] = Object.values(inv.inventory).map((s: any) => ({
-      id: s.id,
-      alias: s.alias,
-      source: s.source,
-      dir: s.dir,
-      entry: s.entry,
-      revision: s.revision,
-      version: s.version,
-      scope: s.scope,
-    }));
+    const all: CellSpec[] = Object.values(inv.inventory)
+      .filter((s: any) => s.kind !== 'runtime' && s.id !== 'hela-runtime')
+      .map((s: any) => ({
+        id: s.id,
+        alias: s.alias,
+        source: s.source,
+        dir: s.dir,
+        entry: s.entry,
+        revision: s.revision,
+        version: s.version,
+        scope: s.scope,
+      }));
 
     if (!this.profile) return all;
     const profilesPath = path.join(this.root, 'config', 'profiles.json');
