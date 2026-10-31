@@ -1,4 +1,4 @@
-# HeLa Runtime (v0.2.0)
+# HeLa Runtime (v0.3.0)
 
 A daemon that boots the 10 HeLa cells as supervised MCP processes and multiplexes their tools behind a single MCP stdio endpoint, plus an agent host entry point (`hela.agent.run`) delegating to `hela-mitosis:agent_run`.
 
@@ -8,30 +8,24 @@ A daemon that boots the 10 HeLa cells as supervised MCP processes and multiplexe
 cd hela-runtime
 npm install
 npm run build
-# boot all cells
 node dist/index.js
-# or a profile subset
 HELA_PROFILE=minimal node dist/index.js
-# optional HTTP health endpoint
+HELA_NAMESPACE_TOOLS=1 node dist/index.js   # opt-in prefixed tool names
 HELA_HTTP_PORT=8787 node dist/index.js
 ```
 
-Configuration via env:
-- `HELA_ECOSYSTEM_ROOT` — path to hela-mcp-ecosystem (default: sibling dir).
-- `HELA_PROFILE` — profile id from profiles.json (default: all cells).
-- `HELA_HTTP_PORT` — enable HTTP health endpoint (default: disabled).
-
-## Features (v0.2.0)
+## Features (v0.3.0)
 - Profile-aware cell selection.
-- Auto-restart on cell crash (up to 3 attempts, exponential backoff).
-- Longer timeouts for `agent_run` (120s) and other calls (60s).
+- Auto-restart on cell crash (up to 3 attempts, exponential backoff); dead cells tracked and reported via MCP notification.
+- Opt-in tool namespacing (`HELA_NAMESPACE_TOOLS=1`) → `hela_<cell>_<tool>`.
+- Longer timeouts (agent_run 120s, others 60s).
 - HTTP `/healthz` endpoint (opt-in).
 - Env-based ecosystem root resolution.
 
 ## Status
 - [x] Boots all 10 cells (292 tools + `hela.agent.run`).
-- [x] Tool proxying verified.
+- [x] Tool proxying verified (canonical + namespaced).
 - [x] Profile filtering.
-- [x] Crash restart.
-- [ ] End-to-end `agent.run` (depends on Needle engine availability).
-- [ ] Profile-based capability enforcement at runtime.
+- [x] Crash restart + dead-cell tracking.
+- [x] End-to-end `agent.run` via Needle (verified).
+- [ ] Profile-based capability enforcement at runtime (by construction: only profile cells booted).
