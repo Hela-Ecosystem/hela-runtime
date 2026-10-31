@@ -3,6 +3,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  McpError,
+  ErrorCode,
 } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -32,6 +34,8 @@ export class HelaRuntime {
   toolToCell = new Map<string, string>(); // exposedName -> cellKey
   toolToReal = new Map<string, string>(); // exposedName -> real tool name
   deadCells = new Set<string>();
+  specs = new Map<string, CellSpec>();
+  lazyCells = new Set<string>();
   server: Server;
   restartAttempts = new Map<string, number>();
 
@@ -50,16 +54,25 @@ export class HelaRuntime {
     const inv = JSON.parse(fs.readFileSync(invPath, 'utf8'));
     const all: CellSpec[] = Object.values(inv.inventory)
       .filter((s: any) => s.kind !== 'runtime' && s.id !== 'hela-runtime')
-      .map((s: any) => ({
-        id: s.id,
-        alias: s.alias,
-        source: s.source,
-        dir: s.dir,
-        entry: s.entry,
-        revision: s.revision,
-        version: s.version,
-        scope: s.scope,
-      }));
+      .map((s: any) => {
+        const spec: CellSpec = {
+          id: s.id,
+          alias: s.alias,
+          source: s.source,
+          dir: s.dir,
+          entry: s.entry,
+          revision: s.revision,
+          version: s.version,
+          scope: s.scope,
+        };
+        (spec as any).lazy = s.lazy === true;
+        return spec;
+      });
+
+    for (const s of all) {
+      this.specs.set(s.id, s);
+      if ((s as any).lazy) this.lazyCells.add(s.id);
+    }
 
     if (!this.profile) return all;
     const profilesPath = path.join(this.root, 'config', 'profiles.json');
@@ -131,8 +144,11 @@ export class HelaRuntime {
 
   async boot(): Promise<void> {
     const specs = this.selectedSpecs();
-    console.error(`[hela-runtime] profile=${this.profile ?? 'all'} cells=${specs.length} root=${this.root}`);
-    await Promise.allSettled(specs.map((s) => this.bootOne(s)));
+    const eager = specs.filter((s) => !this.lazyCells.has(s.id));
+    const lazy = specs.filter((s) => this.lazyCells.has(s.id));
+    console.error(`[hela-runtime] profile=${this.profile ?? 'all'} eager=${eager.length} lazy=${lazy.length} root=${this.root}`);
+    await Promise.allSettled(eager.map((s) => this.bootOne(s)));
+    if (lazy.length) console.error(`[hela-runtime] lazy cells (on-demand): ${lazy.map((s) => s.id).join(', ')}`);
 
     // agent host alias
     const mitosis = this.cells.get('hela-mitosis');
@@ -163,12 +179,27 @@ export class HelaRuntime {
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const name = req.params.name;
       const args = req.params.arguments ?? {};
-      const cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' ? 'hela-mitosis' : undefined);
+      let cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' ? 'hela-mitosis' : undefined);
+      // lazy ignition: if unknown, try booting lazy cells on demand
       if (!cellKey) {
-        return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
+        for (const lc of this.lazyCells) {
+          if (this.deadCells.has(lc)) continue;
+          if (!this.cells.has(lc)) await this.ensureCell(lc);
+          cellKey = this.toolToCell.get(name);
+          if (cellKey) break;
+        }
       }
-      const cell = this.cells.get(cellKey);
+      if (!cellKey) {
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+      }
+      let cell = this.cells.get(cellKey);
+      if ((!cell || !cell.ready) && this.specs.has(cellKey)) {
+        cell = await this.ensureCell(cellKey);
+      }
       if (!cell || !cell.ready) {
+        if (this.deadCells.has(cellKey)) {
+          throw new McpError(ErrorCode.MethodNotFound, `Cell ${cellKey} is unavailable (-32601)`);
+        }
         return { content: [{ type: 'text', text: `Cell not ready: ${cellKey}` }], isError: true };
       }
       const targetName = name === 'hela.agent.run' ? 'agent_run' : (this.toolToReal.get(name) ?? name);
@@ -203,6 +234,17 @@ export class HelaRuntime {
       });
       srv.listen(httpPort, () => console.error(`[hela-runtime] http health on :${httpPort}`));
     }
+  }
+
+  async ensureCell(cellKey: string): Promise<CellHandle | undefined> {
+    const existing = this.cells.get(cellKey);
+    if (existing && existing.ready) return existing;
+    if (this.deadCells.has(cellKey)) return undefined;
+    const spec = this.specs.get(cellKey);
+    if (!spec) return undefined;
+    console.error(`[hela-runtime] lazy-booting ${cellKey}`);
+    await this.bootOne(spec);
+    return this.cells.get(cellKey);
   }
 
   async serveStdio(): Promise<void> {
