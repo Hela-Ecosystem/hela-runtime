@@ -12,7 +12,7 @@ import path from 'node:path';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 
 function ecosystemRoot(): string {
   if (process.env.HELA_ECOSYSTEM_ROOT) return process.env.HELA_ECOSYSTEM_ROOT;
@@ -156,6 +156,9 @@ export class HelaRuntime {
       this.toolToCell.set('hela.agent.run', 'hela-mitosis');
       this.toolToReal.set('hela.agent.run', 'agent_run');
     }
+    // cross-cell pipe (runtime-internal chaining)
+    this.toolToCell.set('hela.pipe', '__runtime__');
+    this.toolToReal.set('hela.pipe', 'hela.pipe');
 
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools: any[] = [];
@@ -173,12 +176,40 @@ export class HelaRuntime {
       if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
         tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: agentTool.inputSchema });
       }
+      if (!tools.find((t) => t.name === 'hela.pipe')) {
+        tools.push({
+          name: 'hela.pipe',
+          description: 'Run a sequence of tool calls across cells in-process, piping each result to the next. Steps: [{cell, tool, args}]. Use "{{prev}}" in string args to inject previous result.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              steps: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    cell: { type: 'string', description: 'Cell id (e.g. hela-membrane)' },
+                    tool: { type: 'string', description: 'Tool name on that cell' },
+                    args: { type: 'object', description: 'Arguments; use "{{prev}}" to inject previous result' },
+                  },
+                  required: ['cell', 'tool'],
+                },
+              },
+            },
+            required: ['steps'],
+          },
+        });
+      }
       return { tools };
     });
 
     this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const name = req.params.name;
       const args = req.params.arguments ?? {};
+
+      if (name === 'hela.pipe') {
+        return await this.runPipe(args);
+      }
       let cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' ? 'hela-mitosis' : undefined);
       // lazy ignition: if unknown, try booting lazy cells on demand
       if (!cellKey) {
@@ -245,6 +276,44 @@ export class HelaRuntime {
     console.error(`[hela-runtime] lazy-booting ${cellKey}`);
     await this.bootOne(spec);
     return this.cells.get(cellKey);
+  }
+
+  private async runPipe(args: any): Promise<any> {
+    const steps = Array.isArray(args?.steps) ? args.steps : [];
+    const results: any[] = [];
+    let prev: any = null;
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      const cellKey = step.cell;
+      const toolName = step.tool;
+      // ensure cell booted (lazy)
+      if (this.specs.has(cellKey) && !this.cells.get(cellKey)?.ready) {
+        await this.ensureCell(cellKey);
+      }
+      const cell = this.cells.get(cellKey);
+      if (!cell || !cell.ready) {
+        return { content: [{ type: 'text', text: `Pipe failed at step ${i}: cell ${cellKey} not ready` }], isError: true };
+      }
+      // resolve args with {{prev}} substitution
+      let stepArgs = step.args ? { ...step.args } : {};
+      for (const k of Object.keys(stepArgs)) {
+        if (typeof stepArgs[k] === 'string') {
+          stepArgs[k] = stepArgs[k].replace(/\{\{prev\}\}/g, typeof prev === 'string' ? prev : JSON.stringify(prev));
+        }
+      }
+      if (prev !== null && stepArgs.prev === undefined && stepArgs.input === undefined) {
+        stepArgs.prev = prev;
+      }
+      try {
+        const res = await callTool(cell, toolName, stepArgs, 60000);
+        const normalized = res?.result ?? res;
+        prev = normalized;
+        results.push({ step: i, cell: cellKey, tool: toolName, result: normalized });
+      } catch (e: any) {
+        return { content: [{ type: 'text', text: `Pipe failed at step ${i} (${cellKey}/${toolName}): ${e?.message ?? e}` }], isError: true };
+      }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify({ ok: true, steps: results.length, results }, null, 2) }] };
   }
 
   async serveStdio(): Promise<void> {
