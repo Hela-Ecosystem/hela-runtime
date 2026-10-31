@@ -10,7 +10,7 @@ import path from 'node:path';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 function ecosystemRoot(): string {
   if (process.env.HELA_ECOSYSTEM_ROOT) return process.env.HELA_ECOSYSTEM_ROOT;
