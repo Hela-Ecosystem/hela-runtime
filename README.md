@@ -22,10 +22,14 @@ HELA_HTTP_PORT=8787 node dist/index.js
 - HTTP `/healthz` endpoint (opt-in).
 - Env-based ecosystem root resolution.
 
+## Cross-cell chaining (two paths)
+- **With runtime:** `hela.pipe` runs a sequence of `{cell, tool, args}` steps in-process (zero host round-trips). Supports `{{prev}}` substitution.
+- **Without runtime:** use `hela-mitosis:workflow_orchestrator` (host-mediated, supports `dependsOn` + `outputMapping`). Available to every user with the ecosystem installed.
+
 ## Status
-- [x] Boots all 10 cells (292 tools + `hela.agent.run`).
+- [x] Boots all 10 cells (292 tools + `hela.agent.run` + `hela.pipe`).
 - [x] Tool proxying verified (canonical + namespaced).
-- [x] Profile filtering.
+- [x] Profile filtering + lazy ignition.
 - [x] Crash restart + dead-cell tracking.
 - [x] End-to-end `agent.run` via Needle (verified).
-- [ ] Profile-based capability enforcement at runtime (by construction: only profile cells booted).
+- [x] Cross-cell chaining: `hela.pipe` (runtime) + `workflow_orchestrator` (mitosis, no runtime).
