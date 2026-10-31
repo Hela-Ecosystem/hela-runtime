@@ -1,6 +1,6 @@
 {
   "name": "hela-runtime",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "HeLa Runtime daemon: boots the 10 HeLa cells as supervised processes, multiplexes their tools behind one MCP endpoint, and hosts agents in-process via Needle.",
   "type": "module",
   "main": "dist/index.js",
