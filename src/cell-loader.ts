@@ -3,11 +3,15 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { CellSpec, CellHandle } from './types.js';
 
-const ROOT = path.resolve(process.cwd(), '..');
+export interface BootOptions {
+  root: string;
+  timeoutMs?: number;
+}
 
-function resolveDir(spec: CellSpec): string {
+function resolveDir(spec: CellSpec, root: string): string {
   const candidates = [
-    path.join(ROOT, spec.dir),
+    path.join(root, '..', spec.dir),
+    path.join(root, spec.dir),
     path.join(process.cwd(), '..', spec.dir),
     path.join(process.cwd(), spec.dir),
   ];
@@ -15,9 +19,10 @@ function resolveDir(spec: CellSpec): string {
   return candidates[0];
 }
 
-export async function bootCell(spec: CellSpec): Promise<CellHandle> {
-  const dir = resolveDir(spec);
+export async function bootCell(spec: CellSpec, opts: BootOptions): Promise<CellHandle> {
+  const dir = resolveDir(spec, opts.root);
   const entry = path.join(dir, spec.entry);
+  const timeoutMs = opts.timeoutMs ?? 15000;
   const proc = spawn('node', [entry], { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
 
   const handle: CellHandle = {
@@ -28,7 +33,6 @@ export async function bootCell(spec: CellSpec): Promise<CellHandle> {
     ready: false,
   };
 
-  // JSON-RPC plumbing
   let buffer = '';
   const pending = new Map<number, (msg: any) => void>();
   let nextId = 1;
@@ -52,25 +56,23 @@ export async function bootCell(spec: CellSpec): Promise<CellHandle> {
     }
   });
 
-  function request(method: string, params: any = {}): Promise<any> {
+  function request(method: string, params: any = {}, t = timeoutMs): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = nextId++;
-      const timer = setTimeout(() => { pending.delete(id); reject(new Error('timeout')); }, 10000);
+      const timer = setTimeout(() => { pending.delete(id); reject(new Error(`timeout after ${t}ms`)); }, t);
       pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
       proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
   }
 
-  // initialize
   const initRes = await request('initialize', {
     protocolVersion: '2024-11-05',
     capabilities: {},
-    clientInfo: { name: 'hela-runtime', version: '0.1.0' },
+    clientInfo: { name: 'hela-runtime', version: '0.2.0' },
   });
   if (initRes.error) throw new Error(`init failed: ${JSON.stringify(initRes.error)}`);
   proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 
-  // tools/list
   const listRes = await request('tools/list', {});
   if (listRes.error) throw new Error(`tools/list failed: ${JSON.stringify(listRes.error)}`);
   for (const t of listRes.result?.tools ?? []) {
@@ -78,14 +80,16 @@ export async function bootCell(spec: CellSpec): Promise<CellHandle> {
   }
   handle.ready = true;
   (handle as any).__request = request;
+  (handle as any).__pending = pending;
   return handle;
 }
 
-export function callTool(handle: CellHandle, name: string, args: any): Promise<any> {
+export function callTool(handle: CellHandle, name: string, args: any, timeoutMs = 30000): Promise<any> {
   const req = (handle as any).__request;
-  return req('tools/call', { name, arguments: args ?? {} });
+  return req('tools/call', { name, arguments: args ?? {} }, timeoutMs);
 }
 
 export function shutdownCell(handle: CellHandle): void {
   try { handle.proc.kill('SIGTERM'); } catch {}
+  handle.ready = false;
 }
