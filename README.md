@@ -1,4 +1,4 @@
-# HeLa Runtime (v0.3.0)
+# HeLa Runtime (v1.0.0)
 
 A daemon that boots the 10 HeLa cells as supervised MCP processes and multiplexes their tools behind a single MCP stdio endpoint, plus an agent host entry point (`hela.agent.run`) delegating to `hela-mitosis:agent_run`.
 
