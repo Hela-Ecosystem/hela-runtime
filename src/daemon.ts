@@ -27,14 +27,18 @@ function ecosystemRoot(): string {
 export class HelaRuntime {
   root: string;
   profile: string | null;
+  namespaced: boolean;
   cells = new Map<string, CellHandle>();
-  toolToCell = new Map<string, string>();
+  toolToCell = new Map<string, string>(); // exposedName -> cellKey
+  toolToReal = new Map<string, string>(); // exposedName -> real tool name
+  deadCells = new Set<string>();
   server: Server;
   restartAttempts = new Map<string, number>();
 
   constructor() {
     this.root = ecosystemRoot();
     this.profile = process.env.HELA_PROFILE || null;
+    this.namespaced = process.env.HELA_NAMESPACE_TOOLS === '1';
     this.server = new Server(
       { name: 'hela-runtime', version: VERSION },
       { capabilities: { tools: {} } },
@@ -74,7 +78,13 @@ export class HelaRuntime {
     try {
       const handle = await bootCell(spec, { root: this.root });
       this.cells.set(handle.key, handle);
-      for (const toolName of handle.tools.keys()) this.toolToCell.set(toolName, handle.key);
+      this.deadCells.delete(spec.id);
+      const cellShort = spec.id.replace(/^hela-/, '');
+      for (const toolName of handle.tools.keys()) {
+        const exposed = this.namespaced ? `hela_${cellShort}_${toolName}` : toolName;
+        this.toolToCell.set(exposed, handle.key);
+        this.toolToReal.set(exposed, toolName);
+      }
       this.restartAttempts.set(spec.id, 0);
       console.error(`[hela-runtime] booted ${spec.id} (${handle.tools.size} tools)`);
 
@@ -95,16 +105,24 @@ export class HelaRuntime {
   private scheduleRestart(spec: CellSpec): void {
     const attempts = this.restartAttempts.get(spec.id) ?? 0;
     if (attempts >= 3) {
-      console.error(`[hela-runtime] giving up restarting ${spec.id} after ${attempts} attempts`);
+      console.error(`[hela-runtime] cell ${spec.id} dead after ${attempts} restart attempts; keeping other cells online`);
+      this.deadCells.add(spec.id);
+      const old = this.cells.get(spec.id);
+      if (old) {
+        for (const [tn, ck] of this.toolToCell) if (ck === spec.id) { this.toolToCell.delete(tn); this.toolToReal.delete(tn); }
+        this.cells.delete(spec.id);
+      }
+      try {
+        this.server.notification({ method: 'notifications/message', params: { level: 'error', data: `HeLa cell ${spec.id} is dead after ${attempts} restart attempts; remaining cells stay online.` } });
+      } catch {}
       return;
     }
     this.restartAttempts.set(spec.id, attempts + 1);
     const delay = Math.min(1000 * 2 ** attempts, 8000);
     setTimeout(() => {
-      // remove stale handle
       const old = this.cells.get(spec.id);
       if (old) {
-        for (const [tn, ck] of this.toolToCell) if (ck === spec.id) this.toolToCell.delete(tn);
+        for (const [tn, ck] of this.toolToCell) if (ck === spec.id) { this.toolToCell.delete(tn); this.toolToReal.delete(tn); }
         this.cells.delete(spec.id);
       }
       this.bootOne(spec);
@@ -120,14 +138,18 @@ export class HelaRuntime {
     const mitosis = this.cells.get('hela-mitosis');
     if (mitosis?.tools.has('agent_run') && !this.toolToCell.has('hela.agent.run')) {
       this.toolToCell.set('hela.agent.run', 'hela-mitosis');
+      this.toolToReal.set('hela.agent.run', 'agent_run');
     }
 
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools: any[] = [];
       for (const cell of this.cells.values()) {
         if (!cell.ready) continue;
+        if (this.deadCells.has(cell.key)) continue;
+        const cellShort = cell.key.replace(/^hela-/, '');
         for (const t of cell.tools.values()) {
-          tools.push({ name: t.name, description: t.description, inputSchema: t.inputSchema });
+          const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
+          tools.push({ name: exposed, description: t.description, inputSchema: t.inputSchema });
         }
       }
       const mitosisCell = this.cells.get('hela-mitosis');
@@ -149,7 +171,7 @@ export class HelaRuntime {
       if (!cell || !cell.ready) {
         return { content: [{ type: 'text', text: `Cell not ready: ${cellKey}` }], isError: true };
       }
-      const targetName = name === 'hela.agent.run' ? 'agent_run' : name;
+      const targetName = name === 'hela.agent.run' ? 'agent_run' : (this.toolToReal.get(name) ?? name);
       const timeout = name === 'hela.agent.run' ? 120000 : 60000;
       try {
         const res = await callTool(cell, targetName, args, timeout);
