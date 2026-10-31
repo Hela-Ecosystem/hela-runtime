@@ -1,17 +1,20 @@
 # HeLa Runtime (v1.0.0)
 
-A daemon that boots the 10 HeLa cells as supervised MCP processes and multiplexes their tools behind a single MCP stdio endpoint, plus an agent host entry point (`hela.agent.run`) delegating to `hela-mitosis:agent_run`.
+A daemon that boots the HeLa cells (per profile) as supervised MCP processes and multiplexes their tools behind a single MCP stdio endpoint, plus an agent host entry point (`hela.agent.run`) delegating to `hela-mitosis:agent_run`.
 
-## Run
+## Profile-aware by default
+
+The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Default is `dev-workspace` (8 cells). Set `HELA_PROFILE=all` for the full 10-cell stack, or `minimal`, `research`, `android-testing`, `3d-modeling`, etc.
 
 ```bash
 cd hela-runtime
 npm install
 npm run build
-node dist/index.js
-HELA_PROFILE=minimal node dist/index.js
-HELA_NAMESPACE_TOOLS=1 node dist/index.js   # opt-in prefixed tool names
-HELA_HTTP_PORT=8787 node dist/index.js
+node dist/index.js                              # dev-workspace (default)
+HELA_PROFILE=minimal node dist/index.js          # 3 cells only
+HELA_PROFILE=all node dist/index.js              # all 10 cells
+HELA_NAMESPACE_TOOLS=1 node dist/index.js        # opt-in prefixed tool names
+HELA_HTTP_PORT=8787 node dist/index.js           # enable HTTP health endpoint
 ```
 
 ## Features (v0.3.0)
