@@ -44,7 +44,11 @@ export class HelaRuntime {
     this.root = ecosystemRoot();
     this.profile = process.env.HELA_PROFILE || 'dev-workspace';
     this.namespaced = process.env.HELA_NAMESPACE_TOOLS === '1';
-    this.server = new Server(
+    this.server = this.createServer();
+  }
+
+  createServer(): Server {
+    return new Server(
       { name: 'hela-runtime', version: VERSION },
       { capabilities: { tools: {} } },
     );
@@ -162,91 +166,7 @@ export class HelaRuntime {
     this.toolToCell.set('hela.pipe', '__runtime__');
     this.toolToReal.set('hela.pipe', 'hela.pipe');
 
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const tools: Tool[] = [];
-      for (const cell of this.cells.values()) {
-        if (!cell.ready) continue;
-        if (this.deadCells.has(cell.key)) continue;
-        const cellShort = cell.key.replace(/^hela-/, '');
-        for (const t of cell.tools.values()) {
-          const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
-          tools.push({ name: exposed, description: t.description, inputSchema: t.inputSchema });
-        }
-      }
-      const mitosisCell = this.cells.get('hela-mitosis');
-      const agentTool = mitosisCell?.tools.get('agent_run');
-      if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
-        tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: agentTool.inputSchema });
-      }
-      if (!tools.find((t) => t.name === 'hela.pipe')) {
-        tools.push({
-          name: 'hela.pipe',
-          description: 'Run a sequence of tool calls across cells in-process, piping each result to the next. Steps: [{cell, tool, args}]. Use "{{prev}}" in string args to inject previous result.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              steps: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    cell: { type: 'string', description: 'Cell id (e.g. hela-membrane)' },
-                    tool: { type: 'string', description: 'Tool name on that cell' },
-                    args: { type: 'object', description: 'Arguments; use "{{prev}}" to inject previous result' },
-                  },
-                  required: ['cell', 'tool'],
-                },
-              },
-            },
-            required: ['steps'],
-          },
-        });
-      }
-      return { tools };
-    });
-
-    this.server.setRequestHandler(CallToolRequestSchema, async (req) => {
-      const name = req.params.name;
-      const args = req.params.arguments ?? {};
-
-      if (name === 'hela.pipe') {
-        return await this.runPipe(args);
-      }
-      let cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' ? 'hela-mitosis' : undefined);
-      // lazy ignition: if unknown, try booting lazy cells on demand
-      if (!cellKey) {
-        for (const lc of this.lazyCells) {
-          if (this.deadCells.has(lc)) continue;
-          if (!this.cells.has(lc)) await this.ensureCell(lc);
-          cellKey = this.toolToCell.get(name);
-          if (cellKey) break;
-        }
-      }
-      if (!cellKey) {
-        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
-      }
-      let cell = this.cells.get(cellKey);
-      if ((!cell || !cell.ready) && this.specs.has(cellKey)) {
-        cell = await this.ensureCell(cellKey);
-      }
-      if (!cell || !cell.ready) {
-        if (this.deadCells.has(cellKey)) {
-          throw new McpError(ErrorCode.MethodNotFound, `Cell ${cellKey} is unavailable (-32601)`);
-        }
-        return { content: [{ type: 'text', text: `Cell not ready: ${cellKey}` }], isError: true };
-      }
-      const targetName = name === 'hela.agent.run' ? 'agent_run' : (this.toolToReal.get(name) ?? name);
-      const timeout = name === 'hela.agent.run' ? 120000 : 60000;
-      try {
-        const res = await callTool(cell, targetName, args, timeout);
-        if (res?.result) return res.result;
-        if (res?.content) return res;
-        return { content: [{ type: 'text', text: JSON.stringify(res) }] };
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
-      }
-    });
+    this.attachHandlers(this.server);
 
     // optional HTTP health endpoint
     const httpPort = parseInt(process.env.HELA_HTTP_PORT || '0', 10);
@@ -321,6 +241,94 @@ export class HelaRuntime {
       }
     }
     return { content: [{ type: 'text', text: JSON.stringify({ ok: true, steps: results.length, results }, null, 2) }] };
+  }
+
+  attachHandlers(server: Server): void {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      const tools: Tool[] = [];
+      for (const cell of this.cells.values()) {
+        if (!cell.ready) continue;
+        if (this.deadCells.has(cell.key)) continue;
+        const cellShort = cell.key.replace(/^hela-/, '');
+        for (const t of cell.tools.values()) {
+          const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
+          tools.push({ name: exposed, description: t.description, inputSchema: t.inputSchema });
+        }
+      }
+      const mitosisCell = this.cells.get('hela-mitosis');
+      const agentTool = mitosisCell?.tools.get('agent_run');
+      if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
+        tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: agentTool.inputSchema });
+      }
+      if (!tools.find((t) => t.name === 'hela.pipe')) {
+        tools.push({
+          name: 'hela.pipe',
+          description: 'Run a sequence of tool calls across cells in-process, piping each result to the next. Steps: [{cell, tool, args}]. Use "{{prev}}" in string args to inject previous result.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              steps: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    cell: { type: 'string', description: 'Cell id (e.g. hela-membrane)' },
+                    tool: { type: 'string', description: 'Tool name on that cell' },
+                    args: { type: 'object', description: 'Arguments; use "{{prev}}" to inject previous result' },
+                  },
+                  required: ['cell', 'tool'],
+                },
+              },
+            },
+            required: ['steps'],
+          },
+        });
+      }
+      return { tools };
+    });
+
+    server.setRequestHandler(CallToolRequestSchema, async (req) => {
+      const name = req.params.name;
+      const args = req.params.arguments ?? {};
+
+      if (name === 'hela.pipe') {
+        return await this.runPipe(args);
+      }
+      let cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' ? 'hela-mitosis' : undefined);
+      // lazy ignition: if unknown, try booting lazy cells on demand
+      if (!cellKey) {
+        for (const lc of this.lazyCells) {
+          if (this.deadCells.has(lc)) continue;
+          if (!this.cells.has(lc)) await this.ensureCell(lc);
+          cellKey = this.toolToCell.get(name);
+          if (cellKey) break;
+        }
+      }
+      if (!cellKey) {
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+      }
+      let cell = this.cells.get(cellKey);
+      if ((!cell || !cell.ready) && this.specs.has(cellKey)) {
+        cell = await this.ensureCell(cellKey);
+      }
+      if (!cell || !cell.ready) {
+        if (this.deadCells.has(cellKey)) {
+          throw new McpError(ErrorCode.MethodNotFound, `Cell ${cellKey} is unavailable (-32601)`);
+        }
+        return { content: [{ type: 'text', text: `Cell not ready: ${cellKey}` }], isError: true };
+      }
+      const targetName = name === 'hela.agent.run' ? 'agent_run' : (this.toolToReal.get(name) ?? name);
+      const timeout = name === 'hela.agent.run' ? 120000 : 60000;
+      try {
+        const res = await callTool(cell, targetName, args, timeout);
+        if (res?.result) return res.result;
+        if (res?.content) return res;
+        return { content: [{ type: 'text', text: JSON.stringify(res) }] };
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
+      }
+    });
   }
 
   async serveStdio(): Promise<void> {
