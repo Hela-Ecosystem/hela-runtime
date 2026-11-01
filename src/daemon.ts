@@ -90,7 +90,7 @@ export class HelaRuntime {
 
   private async bootOne(spec: CellSpec): Promise<void> {
     try {
-      const handle = await bootCell(spec, { root: this.root });
+      const handle = await bootCell(spec, { root: this.root, timeoutMs: 60000 });
       this.cells.set(handle.key, handle);
       this.deadCells.delete(spec.id);
       const cellShort = spec.id.replace(/^hela-/, '');
@@ -265,6 +265,9 @@ export class HelaRuntime {
           res.statusCode = 404;
           res.end('not found');
         }
+      });
+      srv.on('error', (err) => {
+        console.error(`[hela-runtime] http health on :${httpPort} failed: ${err.message} (continuing without http)`);
       });
       srv.listen(httpPort, () => console.error(`[hela-runtime] http health on :${httpPort}`));
     }
