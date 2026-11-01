@@ -5,6 +5,7 @@ import {
   ListToolsRequestSchema,
   McpError,
   ErrorCode,
+  type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -52,20 +53,20 @@ export class HelaRuntime {
   private selectedSpecs(): CellSpec[] {
     const invPath = path.join(this.root, 'config', 'inventory.json');
     const inv = JSON.parse(fs.readFileSync(invPath, 'utf8'));
-    const all: CellSpec[] = Object.values(inv.inventory)
-      .filter((s: any) => s.kind !== 'runtime' && s.id !== 'hela-runtime')
-      .map((s: any) => {
+    const all: CellSpec[] = (Object.values(inv.inventory) as Record<string, unknown>[])
+      .filter((s) => s.kind !== 'runtime' && s.id !== 'hela-runtime')
+      .map((s) => {
         const spec: CellSpec = {
-          id: s.id,
-          alias: s.alias,
-          source: s.source,
-          dir: s.dir,
-          entry: s.entry,
-          revision: s.revision,
-          version: s.version,
-          scope: s.scope,
+          id: String(s.id),
+          alias: String(s.alias),
+          source: String(s.source),
+          dir: String(s.dir),
+          entry: String(s.entry),
+          revision: s.revision ? String(s.revision) : undefined,
+          version: s.version ? String(s.version) : undefined,
+          scope: s.scope ? String(s.scope) : undefined,
+          lazy: s.lazy === true,
         };
-        (spec as any).lazy = s.lazy === true;
         return spec;
       });
 
@@ -78,7 +79,7 @@ export class HelaRuntime {
     const profilesPath = path.join(this.root, 'config', 'profiles.json');
     if (!fs.existsSync(profilesPath)) return all;
     const profiles = JSON.parse(fs.readFileSync(profilesPath, 'utf8')).profiles;
-    const prof = profiles.find((p: any) => p.id === this.profile);
+    const prof = profiles.find((p: { id: string }) => p.id === this.profile);
     if (!prof) {
       console.error(`[hela-runtime] unknown profile "${this.profile}", booting all cells`);
       return all;
@@ -110,8 +111,9 @@ export class HelaRuntime {
       handle.proc.on('error', (err) => {
         console.error(`[hela-runtime] cell ${spec.id} error: ${err.message}`);
       });
-    } catch (e: any) {
-      console.error(`[hela-runtime] FAILED to boot ${spec.id}: ${e?.message ?? e}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[hela-runtime] FAILED to boot ${spec.id}: ${msg}`);
     }
   }
 
@@ -127,7 +129,7 @@ export class HelaRuntime {
       }
       try {
         this.server.notification({ method: 'notifications/message', params: { level: 'error', data: `HeLa cell ${spec.id} is dead after ${attempts} restart attempts; remaining cells stay online.` } });
-      } catch {}
+      } catch (e) { void e; }
       return;
     }
     this.restartAttempts.set(spec.id, attempts + 1);
@@ -161,7 +163,7 @@ export class HelaRuntime {
     this.toolToReal.set('hela.pipe', 'hela.pipe');
 
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const tools: any[] = [];
+      const tools: Tool[] = [];
       for (const cell of this.cells.values()) {
         if (!cell.ready) continue;
         if (this.deadCells.has(cell.key)) continue;
@@ -240,8 +242,9 @@ export class HelaRuntime {
         if (res?.result) return res.result;
         if (res?.content) return res;
         return { content: [{ type: 'text', text: JSON.stringify(res) }] };
-      } catch (e: any) {
-        return { content: [{ type: 'text', text: `Error: ${e?.message ?? e}` }], isError: true };
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
       }
     });
 
@@ -278,10 +281,10 @@ export class HelaRuntime {
     return this.cells.get(cellKey);
   }
 
-  private async runPipe(args: any): Promise<any> {
+  private async runPipe(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const steps = Array.isArray(args?.steps) ? args.steps : [];
-    const results: any[] = [];
-    let prev: any = null;
+    const results: Record<string, unknown>[] = [];
+    let prev: unknown = null;
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       const cellKey = step.cell;
@@ -309,8 +312,9 @@ export class HelaRuntime {
         const normalized = res?.result ?? res;
         prev = normalized;
         results.push({ step: i, cell: cellKey, tool: toolName, result: normalized });
-      } catch (e: any) {
-        return { content: [{ type: 'text', text: `Pipe failed at step ${i} (${cellKey}/${toolName}): ${e?.message ?? e}` }], isError: true };
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: 'text', text: `Pipe failed at step ${i} (${cellKey}/${toolName}): ${msg}` }], isError: true };
       }
     }
     return { content: [{ type: 'text', text: JSON.stringify({ ok: true, steps: results.length, results }, null, 2) }] };

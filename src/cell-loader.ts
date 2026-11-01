@@ -90,6 +90,6 @@ export function callTool(handle: CellHandle, name: string, args: any, timeoutMs 
 }
 
 export function shutdownCell(handle: CellHandle): void {
-  try { handle.proc.kill('SIGTERM'); } catch {}
+  try { handle.proc.kill('SIGTERM'); } catch (e) { void e; }
   handle.ready = false;
 }

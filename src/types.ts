@@ -7,6 +7,7 @@ export interface CellSpec {
   revision?: string;
   version?: string;
   scope?: string;
+  lazy?: boolean;
 }
 
 export interface CellHandle {
