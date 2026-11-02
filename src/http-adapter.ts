@@ -26,7 +26,7 @@ export class HttpAdapter {
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', transport: 'http', version: '1.0.0' }));
+        res.end(JSON.stringify({ status: 'ok', transport: 'http', version: '1.1.0' }));
         return;
       }
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/mcp')) {

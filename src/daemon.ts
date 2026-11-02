@@ -10,14 +10,14 @@ import {
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 function ecosystemRoot(): string {
   if (process.env.HELA_ECOSYSTEM_ROOT) return process.env.HELA_ECOSYSTEM_ROOT;
-  // default: sibling hela-mcp-ecosystem
   const candidates = [
     path.resolve(process.cwd(), '..', 'hela-mcp-ecosystem'),
     path.resolve(process.cwd(), 'hela-mcp-ecosystem'),
@@ -27,24 +27,33 @@ function ecosystemRoot(): string {
   return candidates[0];
 }
 
+function manifestPath(): string {
+  const dir = path.join(os.homedir(), '.cache', 'hela-runtime');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+  return path.join(dir, 'manifest.json');
+}
+
 export class HelaRuntime {
   root: string;
   profile: string | null;
   namespaced: boolean;
   cells = new Map<string, CellHandle>();
-  toolToCell = new Map<string, string>(); // exposedName -> cellKey
-  toolToReal = new Map<string, string>(); // exposedName -> real tool name
+  toolToCell = new Map<string, string>();
+  toolToReal = new Map<string, string>();
   deadCells = new Set<string>();
   specs = new Map<string, CellSpec>();
   lazyCells = new Set<string>();
   server: Server;
   restartAttempts = new Map<string, number>();
+  cachedManifest: Record<string, Array<{ name: string; description?: string; inputSchema: any }>> = {};
+  booting = new Set<string>();
 
   constructor() {
     this.root = ecosystemRoot();
     this.profile = process.env.HELA_PROFILE || 'dev-workspace';
     this.namespaced = process.env.HELA_NAMESPACE_TOOLS === '1';
     this.server = this.createServer();
+    this.loadManifest();
   }
 
   createServer(): Server {
@@ -52,6 +61,35 @@ export class HelaRuntime {
       { name: 'hela-runtime', version: VERSION },
       { capabilities: { tools: {} } },
     );
+  }
+
+  private loadManifest(): void {
+    try {
+      const p = manifestPath();
+      if (fs.existsSync(p)) {
+        this.cachedManifest = JSON.parse(fs.readFileSync(p, 'utf8'));
+      }
+    } catch (e) {
+      console.error(`[hela-runtime] manifest load failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  private saveManifest(): void {
+    try {
+      const m: Record<string, Array<{ name: string; description?: string; inputSchema: any }>> = {};
+      for (const cell of this.cells.values()) {
+        if (!cell.ready) continue;
+        m[cell.key] = [...cell.tools.values()];
+      }
+      // merge with cached
+      for (const [k, v] of Object.entries(this.cachedManifest)) {
+        if (!m[k]) m[k] = v;
+      }
+      fs.writeFileSync(manifestPath(), JSON.stringify(m));
+      this.cachedManifest = m;
+    } catch (e) {
+      console.error(`[hela-runtime] manifest save failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   private selectedSpecs(): CellSpec[] {
@@ -76,7 +114,8 @@ export class HelaRuntime {
 
     for (const s of all) {
       this.specs.set(s.id, s);
-      if ((s as any).lazy) this.lazyCells.add(s.id);
+      // ALL cells are lazy by default for fast startup
+      this.lazyCells.add(s.id);
     }
 
     if (!this.profile) return all;
@@ -93,6 +132,8 @@ export class HelaRuntime {
   }
 
   private async bootOne(spec: CellSpec): Promise<void> {
+    if (this.booting.has(spec.id)) return;
+    this.booting.add(spec.id);
     try {
       const handle = await bootCell(spec, { root: this.root, timeoutMs: 60000 });
       this.cells.set(handle.key, handle);
@@ -115,25 +156,26 @@ export class HelaRuntime {
       handle.proc.on('error', (err) => {
         console.error(`[hela-runtime] cell ${spec.id} error: ${err.message}`);
       });
+
+      this.saveManifest();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[hela-runtime] FAILED to boot ${spec.id}: ${msg}`);
+    } finally {
+      this.booting.delete(spec.id);
     }
   }
 
   private scheduleRestart(spec: CellSpec): void {
     const attempts = this.restartAttempts.get(spec.id) ?? 0;
     if (attempts >= 3) {
-      console.error(`[hela-runtime] cell ${spec.id} dead after ${attempts} restart attempts; keeping other cells online`);
+      console.error(`[hela-runtime] cell ${spec.id} dead after ${attempts} restart attempts`);
       this.deadCells.add(spec.id);
       const old = this.cells.get(spec.id);
       if (old) {
         for (const [tn, ck] of this.toolToCell) if (ck === spec.id) { this.toolToCell.delete(tn); this.toolToReal.delete(tn); }
         this.cells.delete(spec.id);
       }
-      try {
-        this.server.notification({ method: 'notifications/message', params: { level: 'error', data: `HeLa cell ${spec.id} is dead after ${attempts} restart attempts; remaining cells stay online.` } });
-      } catch (e) { void e; }
       return;
     }
     this.restartAttempts.set(spec.id, attempts + 1);
@@ -150,18 +192,16 @@ export class HelaRuntime {
 
   async boot(): Promise<void> {
     const specs = this.selectedSpecs();
-    const eager = specs.filter((s) => !this.lazyCells.has(s.id));
-    const lazy = specs.filter((s) => this.lazyCells.has(s.id));
-    console.error(`[hela-runtime] profile=${this.profile ?? 'all'} eager=${eager.length} lazy=${lazy.length} root=${this.root}`);
-    await Promise.allSettled(eager.map((s) => this.bootOne(s)));
-    if (lazy.length) console.error(`[hela-runtime] lazy cells (on-demand): ${lazy.map((s) => s.id).join(', ')}`);
-
-    // agent host alias
-    const mitosis = this.cells.get('hela-mitosis');
-    if (mitosis?.tools.has('agent_run') && !this.toolToCell.has('hela.agent.run')) {
-      this.toolToCell.set('hela.agent.run', 'hela-mitosis');
-      this.toolToReal.set('hela.agent.run', 'agent_run');
+    console.error(`[hela-runtime] profile=${this.profile ?? 'all'} cells=${specs.length} (all lazy) root=${this.root}`);
+    // Don't boot eagerly — all cells are lazy. Kick off background boot for all.
+    // Stagger slightly to avoid CPU spike.
+    let delay = 0;
+    for (const spec of specs) {
+      setTimeout(() => { this.bootOne(spec); }, delay);
+      delay += 200;
     }
+
+    // agent host alias (will be set when mitosis boots, handled in CallTool)
     // cross-cell pipe (runtime-internal chaining)
     this.toolToCell.set('hela.pipe', '__runtime__');
     this.toolToReal.set('hela.pipe', 'hela.pipe');
@@ -177,7 +217,10 @@ export class HelaRuntime {
             status: 'ok',
             version: VERSION,
             profile: this.profile ?? 'all',
-            cells: [...this.cells.values()].map((c) => ({ id: c.key, ready: c.ready, tools: c.tools.size })),
+            cells: [...this.specs.keys()].map((id) => {
+              const cell = this.cells.get(id);
+              return { id, ready: cell?.ready ?? false, tools: cell?.tools.size ?? (this.cachedManifest[id]?.length ?? 0) };
+            }),
           };
           res.setHeader('Content-Type', 'application/json');
           res.end(JSON.stringify(status));
@@ -199,6 +242,15 @@ export class HelaRuntime {
     if (this.deadCells.has(cellKey)) return undefined;
     const spec = this.specs.get(cellKey);
     if (!spec) return undefined;
+    if (this.booting.has(cellKey)) {
+      // wait for boot to finish
+      await new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (!this.booting.has(cellKey)) { clearInterval(check); resolve(); }
+        }, 100);
+      });
+      return this.cells.get(cellKey);
+    }
     console.error(`[hela-runtime] lazy-booting ${cellKey}`);
     await this.bootOne(spec);
     return this.cells.get(cellKey);
@@ -209,10 +261,9 @@ export class HelaRuntime {
     const results: Record<string, unknown>[] = [];
     let prev: unknown = null;
     for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
+      const step = steps[i] as any;
       const cellKey = step.cell;
       const toolName = step.tool;
-      // ensure cell booted (lazy)
       if (this.specs.has(cellKey) && !this.cells.get(cellKey)?.ready) {
         await this.ensureCell(cellKey);
       }
@@ -220,11 +271,10 @@ export class HelaRuntime {
       if (!cell || !cell.ready) {
         return { content: [{ type: 'text', text: `Pipe failed at step ${i}: cell ${cellKey} not ready` }], isError: true };
       }
-      // resolve args with {{prev}} substitution
       let stepArgs = step.args ? { ...step.args } : {};
       for (const k of Object.keys(stepArgs)) {
         if (typeof stepArgs[k] === 'string') {
-          stepArgs[k] = stepArgs[k].replace(/\{\{prev\}\}/g, typeof prev === 'string' ? prev : JSON.stringify(prev));
+          stepArgs[k] = (stepArgs[k] as string).replace(/\{\{prev\}\}/g, typeof prev === 'string' ? prev : JSON.stringify(prev));
         }
       }
       if (prev !== null && stepArgs.prev === undefined && stepArgs.input === undefined) {
@@ -246,20 +296,41 @@ export class HelaRuntime {
   attachHandlers(server: Server): void {
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools: Tool[] = [];
+      const seen = new Set<string>();
+
+      // From booted cells
       for (const cell of this.cells.values()) {
         if (!cell.ready) continue;
         if (this.deadCells.has(cell.key)) continue;
         const cellShort = cell.key.replace(/^hela-/, '');
         for (const t of cell.tools.values()) {
           const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
+          if (seen.has(exposed)) continue;
+          seen.add(exposed);
           tools.push({ name: exposed, description: t.description, inputSchema: t.inputSchema });
         }
       }
-      const mitosisCell = this.cells.get('hela-mitosis');
-      const agentTool = mitosisCell?.tools.get('agent_run');
-      if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
-        tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: agentTool.inputSchema });
+
+      // From cached manifest (for not-yet-booted cells)
+      for (const [cellKey, cachedTools] of Object.entries(this.cachedManifest)) {
+        if (this.cells.get(cellKey)?.ready) continue;
+        if (this.deadCells.has(cellKey)) continue;
+        const cellShort = cellKey.replace(/^hela-/, '');
+        for (const t of cachedTools) {
+          const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
+          if (seen.has(exposed)) continue;
+          seen.add(exposed);
+          tools.push({ name: exposed, description: t.description, inputSchema: t.inputSchema });
+        }
       }
+
+      // agent host alias
+      const mitosisCell = this.cells.get('hela-mitosis');
+      const agentTool = mitosisCell?.tools.get('agent_run') ?? this.cachedManifest['hela-mitosis']?.find((t) => t.name === 'agent_run');
+      if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
+        tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: (agentTool as any).inputSchema });
+      }
+
       if (!tools.find((t) => t.name === 'hela.pipe')) {
         tools.push({
           name: 'hela.pipe',
@@ -295,13 +366,23 @@ export class HelaRuntime {
         return await this.runPipe(args);
       }
       let cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' ? 'hela-mitosis' : undefined);
-      // lazy ignition: if unknown, try booting lazy cells on demand
+
+      // lazy ignition: try all lazy cells
       if (!cellKey) {
         for (const lc of this.lazyCells) {
           if (this.deadCells.has(lc)) continue;
           if (!this.cells.has(lc)) await this.ensureCell(lc);
           cellKey = this.toolToCell.get(name);
           if (cellKey) break;
+        }
+      }
+      if (!cellKey) {
+        // maybe cached manifest knows which cell has this tool
+        for (const [ck, cachedTools] of Object.entries(this.cachedManifest)) {
+          if (cachedTools.some((t) => t.name === name || (this.namespaced && t.name === name.split('_').slice(2).join('_')))) {
+            cellKey = ck;
+            break;
+          }
         }
       }
       if (!cellKey) {
