@@ -407,6 +407,10 @@ export class HelaRuntime {
         return { content: [{ type: 'text', text: JSON.stringify(res) }] };
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes('timeout after') && cell) {
+          console.error(`[hela-runtime] callTool timed out on ${cellKey}/${targetName}, reaping hung cell process...`);
+          shutdownCell(cell);
+        }
         return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
       }
     });
