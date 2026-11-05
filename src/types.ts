@@ -16,6 +16,8 @@ export interface CellHandle {
   proc: import('node:child_process').ChildProcess;
   tools: Map<string, { name: string; description?: string; inputSchema: any }>;
   ready: boolean;
+  stopReason?: 'timeout' | 'shutdown' | 'boot-failure' | 'transport-error';
+  exited: Promise<void>;
 }
 
 export interface ToolRoute {

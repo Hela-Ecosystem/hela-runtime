@@ -1,6 +1,6 @@
 # HeLa Runtime
 
-> **HeLa Runtime v1.0.0** — a single-process daemon that boots the HeLa cells as supervised MCP child processes and multiplexes their tools behind one MCP stdio endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
+> **HeLa Runtime v1.1.0** — a supervising daemon that boots HeLa cells as MCP child processes and multiplexes their tools behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
 
 ![Blotcat plugging MCP server cables into the central AI Hub](https://raw.githubusercontent.com/Hela-Ecosystem/.github/main/profile/hela-logo-1024.png)
 
@@ -18,8 +18,8 @@ Instead of connecting your AI client to 10 separate MCP servers, you connect to 
 
 * **Boots** the cells defined by your chosen profile as supervised child processes.
 * **Multiplexes** their tools behind a single MCP stdio endpoint (canonical names by default, opt-in namespaced).
-* **Lazy-ignites** heavy cells (Plastid, Receptor) on first tool call.
-* **Recovers** from cell crashes automatically (up to 3 attempts, exponential backoff); other cells stay online.
+* **Starts** selected cells in the background at staggered intervals; true first-call-only ignition remains planned.
+* **Recovers** from crashes and tool timeouts after the old process exits, with up to three cumulative retries per cell/runtime and exponential backoff. Hung processes receive SIGTERM followed by SIGKILL if necessary; other cells stay online.
 * **Chains** tool calls in-process via `hela.pipe` (zero host round-trips).
 * **Hosts** agents via `hela.agent.run` (Needle 3 orchestration).
 
@@ -28,7 +28,7 @@ Instead of connecting your AI client to 10 separate MCP servers, you connect to 
 ## Quick Start
 
 ### 1. Prerequisites
-* **Node.js**: `>= 18.0.0` (v20+ LTS recommended)
+* **Node.js**: Node 22 LTS is the tested runtime and Nix development environment.
 * **HeLa MCP Ecosystem**: cloned as a sibling directory (or set `HELA_ECOSYSTEM_ROOT`).
 
 ### 2. Install & Build
@@ -39,9 +39,20 @@ npm install
 npm run build
 ```
 
+Or use the pinned Nix package, which fetches npm dependencies through a fixed-output derivation and builds offline:
+
+```bash
+nix build .
+HELA_ECOSYSTEM_ROOT=/path/to/hela-mcp-ecosystem ./result/bin/hela-runtime
+nix develop
+```
+
+Keep the output link for deployed packages as a garbage-collection root. Node dependencies are installed from `package-lock.json`; a populated but stale `node_modules` directory is not dependency validation.
+
 ### 3. Run
 ```bash
 node dist/index.js                              # dev-workspace profile (default, 8 cells)
+node dist/index.js --transport http --port 8090   # /mcp and /healthz on one HTTP listener
 HELA_PROFILE=minimal node dist/index.js          # 3 cells only
 HELA_PROFILE=all node dist/index.js              # all 10 cells
 HELA_NAMESPACE_TOOLS=1 node dist/index.js        # opt-in prefixed tool names (hela_<cell>_<tool>)
@@ -61,18 +72,18 @@ This builds all profile cells + the daemon and writes a single-entry client conf
 
 The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Default is `dev-workspace`.
 
-| Profile | Cells booted | Tools |
-|---|---|---|
-| `minimal` | mitosis, genome, enzyme | 79 |
-| `dev-workspace` | mitosis, genome, membrane, nucleus, ribosome, enzyme, phenotype, cytosol | 233 |
-| `headless-server` | mitosis, genome, membrane, nucleus, ribosome, enzyme, phenotype | 160 |
-| `research` | mitosis, genome, enzyme, membrane, cytosol | 148 |
-| `web-devops` | mitosis, genome, membrane, nucleus, phenotype, cytosol | 183 |
-| `android-testing` | mitosis, genome, nucleus, receptor, enzyme | 126 |
-| `3d-modeling` | mitosis, genome, plastid, membrane, nucleus | 103 |
-| `all` | all 10 cells | 293 |
+| Profile | Cells booted |
+|---|---|
+| `minimal` | mitosis, genome, enzyme |
+| `dev-workspace` | mitosis, genome, membrane, nucleus, ribosome, enzyme, phenotype, cytosol |
+| `headless-server` | mitosis, genome, membrane, nucleus, ribosome, enzyme, phenotype |
+| `research` | mitosis, genome, enzyme, membrane, cytosol |
+| `web-devops` | mitosis, genome, membrane, nucleus, phenotype, cytosol |
+| `android-testing` | mitosis, genome, nucleus, receptor, enzyme |
+| `3d-modeling` | mitosis, genome, plastid, membrane, nucleus |
+| `all` | all 10 cells |
 
-Heavy cells (`hela-receptor`, `hela-plastid`) are **lazy-ignited** — booted on first tool call, not at startup.
+Discovery is profile-scoped, including cached manifests; an unknown profile fails instead of silently booting every cell. Tool counts depend on enabled cell features, so use `tools/list` rather than a static total. Full revision/configuration cache invalidation and true lazy ignition remain follow-up work.
 
 ---
 
@@ -92,16 +103,25 @@ Heavy cells (`hela-receptor`, `hela-plastid`) are **lazy-ignited** — booted on
 * **With runtime:** `hela.pipe` runs a sequence of `{cell, tool, args}` steps in-process (zero host round-trips). Supports `{{prev}}` substitution for piping results.
 * **Without runtime:** use `hela-mitosis:workflow_orchestrator` (host-mediated, supports `dependsOn` + `outputMapping`). Available to every user with the ecosystem installed.
 
+### Genome memory and mission coordination
+
+Memory safety belongs to the Genome cell, not the runtime transport. Rebuild `project-mcp` when updating its backup, vault-sync, or mission-claim implementation; restarting an old build does not install those changes. Keep SQLite as the base engine and Obsidian optional. Use Genome's conflict-aware `dist/vault-sync.js` hook rather than bidirectional `rsync --delete`; see the [Genome configuration and recovery guide](https://github.com/Hela-Ecosystem/project-mcp#obsidian-vault-mirror-optional-remote-capable-agent-controllable).
+
+Exclusive mission claims coordinate callers of the same Genome ledger. Agents on different machines must use that shared server endpoint; separate local SQLite databases and vault mirrors do not replicate missions or provide a distributed lock. Runtime deployment, cell revisions, and session behavior require separate verification.
+
 ---
 
 ## Diagnostics
 
 ```bash
+npm test                         # isolated hung-cell, restart, profile, and shutdown tests
 # From the ecosystem directory
 ./setup.sh doctor          # includes hela-runtime (build artifact + stdio smoke + version)
-node scripts/verify-versions.mjs   # version consistency across all cells + runtime
+node scripts/verify-versions.mjs --profile dev-workspace  # initialize/list + package/inventory/snapshot/pin agreement
 node scripts/test-runtime-parity.mjs  # parity + crash-recovery harness
 ```
+
+Ecosystem doctor, integration, and version probes use temporary homes/project memory with vault hooks and credentials excluded. They require real MCP replies; merely staying alive is not a successful handshake. Optional hardware capability still requires separate device/Blender integration tests.
 
 ---
 

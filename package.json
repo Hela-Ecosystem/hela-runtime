@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node scripts/test.mjs",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "clean": "rm -rf dist"
