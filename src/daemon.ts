@@ -13,8 +13,8 @@ import path from 'node:path';
 import os from 'node:os';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
-
-const VERSION = '1.1.0';
+import { ManifestStore } from './manifest.js';
+import { VERSION } from './version.js';
 
 export interface RuntimeOptions {
   root?: string;
@@ -61,19 +61,21 @@ export class HelaRuntime {
   cachedManifest: Record<string, Array<{ name: string; description?: string; inputSchema: any }>> = {};
   booting = new Set<string>();
   private bootTasks = new Map<string, Promise<void>>();
-  private startupTimers = new Set<NodeJS.Timeout>();
   private restartTimers = new Map<string, NodeJS.Timeout>();
   private stopping = false;
+  private booted = false;
   private shutdownTask?: Promise<void>;
   private bootAbort = new AbortController();
   private healthServer?: http.Server;
+  private manifests!: ManifestStore;
+  manifestSources = new Map<string, 'cache' | 'catalog' | 'missing'>();
+  cellStartupMs = new Map<string, number>();
 
   constructor(private readonly options: RuntimeOptions = {}) {
     this.root = options.root ?? ecosystemRoot();
     this.profile = options.profile === undefined ? process.env.HELA_PROFILE || 'dev-workspace' : options.profile;
     this.namespaced = options.namespaced ?? process.env.HELA_NAMESPACE_TOOLS === '1';
     this.server = this.createServer();
-    this.loadManifest();
   }
 
   createServer(): Server {
@@ -81,35 +83,6 @@ export class HelaRuntime {
       { name: 'hela-runtime', version: VERSION },
       { capabilities: { tools: {} } },
     );
-  }
-
-  private loadManifest(): void {
-    try {
-      const p = this.options.manifestPath ?? manifestPath();
-      if (fs.existsSync(p)) {
-        this.cachedManifest = JSON.parse(fs.readFileSync(p, 'utf8'));
-      }
-    } catch (e) {
-      console.error(`[hela-runtime] manifest load failed: ${e instanceof Error ? e.message : e}`);
-    }
-  }
-
-  private saveManifest(): void {
-    try {
-      const m: Record<string, Array<{ name: string; description?: string; inputSchema: any }>> = {};
-      for (const cell of this.cells.values()) {
-        if (!cell.ready) continue;
-        m[cell.key] = [...cell.tools.values()];
-      }
-      // merge with cached
-      for (const [k, v] of Object.entries(this.cachedManifest)) {
-        if (!m[k]) m[k] = v;
-      }
-      fs.writeFileSync(this.options.manifestPath ?? manifestPath(), JSON.stringify(m));
-      this.cachedManifest = m;
-    } catch (e) {
-      console.error(`[hela-runtime] manifest save failed: ${e instanceof Error ? e.message : e}`);
-    }
   }
 
   private selectedSpecs(): CellSpec[] {
@@ -128,6 +101,8 @@ export class HelaRuntime {
           version: s.version ? String(s.version) : undefined,
           scope: s.scope ? String(s.scope) : undefined,
           lazy: s.lazy === true,
+          env: Array.isArray(s.env) ? s.env as string[] : [],
+          toolFeatures: s.toolFeatures as CellSpec['toolFeatures'],
         };
         return spec;
       });
@@ -168,6 +143,8 @@ export class HelaRuntime {
 
   private async startCell(spec: CellSpec): Promise<void> {
     try {
+      const started = performance.now();
+      const fingerprint = this.manifests.identity(spec).fingerprint;
       const handle = await bootCell(spec, {
         root: this.root,
         timeoutMs: this.options.bootTimeoutMs ?? 60000,
@@ -179,6 +156,7 @@ export class HelaRuntime {
         return;
       }
       this.cells.set(handle.key, handle);
+      this.cellStartupMs.set(spec.id, performance.now() - started);
       this.deadCells.delete(spec.id);
       const cellShort = spec.id.replace(/^hela-/, '');
       for (const toolName of handle.tools.keys()) {
@@ -196,7 +174,9 @@ export class HelaRuntime {
       handle.proc.once('exit', onExit);
       if (handle.proc.exitCode !== null || handle.proc.signalCode !== null) onExit();
 
-      this.saveManifest();
+      this.cachedManifest[spec.id] = [...handle.tools.values()];
+      try { this.manifests.save(spec.id, fingerprint, [...handle.tools.values()]); }
+      catch { console.error(`[hela-runtime] manifest save failed for ${spec.id}`); }
     } catch (e: unknown) {
       if (this.stopping) return;
       const msg = e instanceof Error ? e.message : String(e);
@@ -234,20 +214,28 @@ export class HelaRuntime {
   }
 
   async boot(): Promise<void> {
-    if (this.stopping) return;
+    if (this.stopping || this.booted) return;
     const specs = this.selectedSpecs();
-    console.error(`[hela-runtime] profile=${this.profile ?? 'all'} cells=${specs.length} (all lazy) root=${this.root}`);
-    // Don't boot eagerly — all cells are lazy. Kick off background boot for all.
-    // Stagger slightly to avoid CPU spike.
-    let delay = 0;
+    this.manifests = new ManifestStore(this.options.manifestPath ?? manifestPath(), this.root, this.profile, this.namespaced);
+    this.cachedManifest = {};
     for (const spec of specs) {
-      const timer = setTimeout(() => {
-        this.startupTimers.delete(timer);
-        void this.bootOne(spec);
-      }, delay);
-      this.startupTimers.add(timer);
-      delay += 200;
+      try {
+        const manifest = this.manifests.load(spec);
+        this.manifestSources.set(spec.id, manifest.source);
+        this.cachedManifest[spec.id] = manifest.tools;
+        const cellShort = spec.id.replace(/^hela-/, '');
+        for (const tool of manifest.tools) {
+          const exposed = this.namespaced ? `hela_${cellShort}_${tool.name}` : tool.name;
+          if (this.toolToCell.has(exposed)) throw new Error(`Duplicate tool: ${exposed}`);
+          this.toolToCell.set(exposed, spec.id);
+          this.toolToReal.set(exposed, tool.name);
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('Duplicate tool:')) throw error;
+        this.manifestSources.set(spec.id, 'missing');
+      }
     }
+    console.error(`[hela-runtime] profile=${this.profile ?? 'all'} cells=${specs.length} mode=on-demand`);
 
     // agent host alias (will be set when mitosis boots, handled in CallTool)
     // cross-cell pipe (runtime-internal chaining)
@@ -255,6 +243,7 @@ export class HelaRuntime {
     this.toolToReal.set('hela.pipe', 'hela.pipe');
 
     this.attachHandlers(this.server);
+    this.booted = true;
 
     // optional HTTP health endpoint
     const httpPort = parseInt(process.env.HELA_HTTP_PORT || '0', 10);
@@ -421,27 +410,9 @@ export class HelaRuntime {
       if (name === 'hela.pipe') {
         return await this.runPipe(args);
       }
-      let cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' && this.specs.has('hela-mitosis') ? 'hela-mitosis' : undefined);
-
-      // lazy ignition: try all lazy cells
-      if (!cellKey) {
-        for (const lc of this.lazyCells) {
-          if (this.deadCells.has(lc)) continue;
-          if (!this.cells.has(lc)) await this.ensureCell(lc);
-          cellKey = this.toolToCell.get(name);
-          if (cellKey) break;
-        }
-      }
-      if (!cellKey) {
-        // maybe cached manifest knows which cell has this tool
-        for (const [ck, cachedTools] of Object.entries(this.cachedManifest)) {
-          if (!this.specs.has(ck) || this.deadCells.has(ck)) continue;
-          if (cachedTools.some((t) => t.name === name || (this.namespaced && t.name === name.split('_').slice(2).join('_')))) {
-            cellKey = ck;
-            break;
-          }
-        }
-      }
+      const agentKnown = this.cells.get('hela-mitosis')?.tools.has('agent_run')
+        || this.cachedManifest['hela-mitosis']?.some(tool => tool.name === 'agent_run');
+      const cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' && agentKnown ? 'hela-mitosis' : undefined);
       if (!cellKey || !this.specs.has(cellKey)) {
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }
@@ -456,6 +427,7 @@ export class HelaRuntime {
         return { content: [{ type: 'text', text: `Cell not ready: ${cellKey}` }], isError: true };
       }
       const targetName = name === 'hela.agent.run' ? 'agent_run' : (this.toolToReal.get(name) ?? name);
+      if (!cell.tools.has(targetName)) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       const timeout = name === 'hela.agent.run' ? this.options.agentTimeoutMs ?? 120000 : this.options.toolTimeoutMs ?? 60000;
       try {
         const res = await callTool(cell, targetName, args, timeout);
@@ -478,9 +450,7 @@ export class HelaRuntime {
   shutdown(): Promise<void> {
     if (this.shutdownTask) return this.shutdownTask;
     this.stopping = true;
-    for (const timer of this.startupTimers) clearTimeout(timer);
     for (const timer of this.restartTimers.values()) clearTimeout(timer);
-    this.startupTimers.clear();
     this.restartTimers.clear();
     this.bootAbort.abort();
     this.shutdownTask = Promise.all([

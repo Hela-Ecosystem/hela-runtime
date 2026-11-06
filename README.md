@@ -1,6 +1,6 @@
 # HeLa Runtime
 
-> **HeLa Runtime v1.1.0** — a supervising daemon that boots HeLa cells as MCP child processes and multiplexes their tools behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
+> **HeLa Runtime v1.2.0** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
 
 ![Blotcat plugging MCP server cables into the central AI Hub](https://raw.githubusercontent.com/Hela-Ecosystem/.github/main/profile/hela-logo-1024.png)
 
@@ -18,7 +18,7 @@ Instead of connecting your AI client to 10 separate MCP servers, you connect to 
 
 * **Boots** the cells defined by your chosen profile as supervised child processes.
 * **Multiplexes** their tools behind a single MCP stdio endpoint (canonical names by default, opt-in namespaced).
-* **Starts** selected cells in the background at staggered intervals; true first-call-only ignition remains planned.
+* **Starts** only the cell targeted by the first tool call. Discovery starts no cells, and concurrent first calls share one startup.
 * **Recovers** from crashes and tool timeouts after the old process exits, with up to three cumulative retries per cell/runtime and exponential backoff. Hung processes receive SIGTERM followed by SIGKILL if necessary; other cells stay online.
 * **Chains** tool calls in-process via `hela.pipe` (zero host round-trips).
 * **Hosts** agents via `hela.agent.run` (Needle 3 orchestration).
@@ -72,7 +72,7 @@ This builds all profile cells + the daemon and writes a single-entry client conf
 
 The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Default is `dev-workspace`.
 
-| Profile | Cells booted |
+| Profile | Eligible cells (started only when invoked) |
 |---|---|
 | `minimal` | mitosis, genome, enzyme |
 | `dev-workspace` | mitosis, genome, membrane, nucleus, ribosome, enzyme, phenotype, cytosol |
@@ -83,7 +83,21 @@ The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Defaul
 | `3d-modeling` | mitosis, genome, plastid, membrane, nucleus |
 | `all` | all 10 cells |
 
-Discovery is profile-scoped, including cached manifests; an unknown profile fails instead of silently booting every cell. Tool counts depend on enabled cell features, so use `tools/list` rather than a static total. Full revision/configuration cache invalidation and true lazy ignition remain follow-up work.
+Discovery is profile-scoped, including cached manifests; an unknown profile fails instead of silently booting every cell. Tool counts depend on enabled cell features, so use `tools/list` rather than a static total. Profiles select eligible cells, not processes that must all run at startup. Standalone MCP servers retain their existing behavior.
+
+### Discovery without starting cells
+
+The ecosystem's generated `config/tool-catalog.json` provides standalone tool schemas before any cell starts. It is derived from `config/inventory.json`, actual isolated MCP probes, and declared feature variants—not a second registry. After installing/building or changing a cell, regenerate the selected profile's catalog from the ecosystem directory:
+
+```bash
+npm run catalog:generate -- --profile dev-workspace
+npm run catalog:check -- --profile dev-workspace
+npm run test:profiles -- --profile dev-workspace
+```
+
+The runtime accepts catalog schemas only when the declared/actual revision, version, and build-content digest match. A revision can have multiple build digests, but the generator retains them together only after fresh probes confirm identical schemas for every declared feature variant. Its private format-2 cache additionally separates ecosystem roots, profiles, namespace modes, declared environment settings, and effective tool features. Writes are atomic; only fingerprints and schemas are stored, never environment values. Legacy/corrupt/stale caches are ignored. Configuration changes take effect on a new runtime instance, not by mutating an already-running client's environment.
+
+If neither catalog nor valid cache covers a cell, its tools are not falsely advertised and unknown calls do not scan/start other cells. `hela.pipe` remains available for explicit `{cell, tool, args}` routing, which can bootstrap that named cell and learn its schemas. Regenerate the catalog to restore complete cold discovery. A missing catalog does not silently become eager startup.
 
 ---
 
@@ -116,9 +130,10 @@ Exclusive mission claims coordinate callers of the same Genome ledger. Agents on
 ```bash
 npm test                         # isolated hung-cell, restart, profile, and shutdown tests
 # From the ecosystem directory
-./setup.sh doctor          # includes hela-runtime (build artifact + stdio smoke + version)
+./setup.sh doctor --profile dev-workspace --runtime  # selected cells, runtime catalog, versions, pins, zero discovery spawns
 node scripts/verify-versions.mjs --profile dev-workspace  # initialize/list + package/inventory/snapshot/pin agreement
 node scripts/test-runtime-parity.mjs  # parity + crash-recovery harness
+npm run test:profiles                 # all eight profiles, namespacing off/on, cold/warm timings
 ```
 
 Ecosystem doctor, integration, and version probes use temporary homes/project memory with vault hooks and credentials excluded. They require real MCP replies; merely staying alive is not a successful handshake. Optional hardware capability still requires separate device/Blender integration tests.

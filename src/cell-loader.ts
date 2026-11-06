@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { CellSpec, CellHandle } from './types.js';
+import { VERSION } from './version.js';
 
 export interface BootOptions {
   root: string;
@@ -26,7 +27,7 @@ interface CellState {
 
 const states = new WeakMap<CellHandle, CellState>();
 
-function resolveDir(spec: CellSpec, root: string): string {
+export function resolveDir(spec: CellSpec, root: string): string {
   const candidates = [
     path.join(root, '..', spec.dir),
     path.join(root, spec.dir),
@@ -127,7 +128,7 @@ export async function bootCell(spec: CellSpec, opts: BootOptions): Promise<CellH
     const initRes = await request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
-      clientInfo: { name: 'hela-runtime', version: '0.2.0' },
+      clientInfo: { name: 'hela-runtime', version: VERSION },
     });
     if (initRes.error) throw new Error(`init failed: ${JSON.stringify(initRes.error)}`);
     proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');

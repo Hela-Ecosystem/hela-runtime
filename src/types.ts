@@ -8,6 +8,8 @@ export interface CellSpec {
   version?: string;
   scope?: string;
   lazy?: boolean;
+  env?: string[];
+  toolFeatures?: Record<string, { default?: boolean; probePath?: string; probePathWindows?: string; pathEnv?: string }>;
 }
 
 export interface CellHandle {

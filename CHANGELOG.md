@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
+
+- Start cells on first invocation only, share concurrent startup attempts, and avoid all-cell scanning on unknown calls. Discovery uses a generated ecosystem catalog without starting cells.
+- Invalidate schema caches by root/profile/namespace, declared and actual revisions, build contents, effective tool features, and declared environment configuration; publish caches atomically without environment values.
+- Reject stale catalog entries; retain explicit `hela.pipe` bootstrap for uncatalogued cells. Preserve standalone servers and the `dev-workspace` default.
+- Expand isolated regressions to cover lazy startup, concurrency, cache changes, profile switching, and cold/warm measurements. Runtime version surfaces now derive from package metadata.
+
+### Included reliability fixes
 
 - Reap hung cells with SIGTERM/SIGKILL, reject pending RPCs, and restart after actual exit, including calls through `hela.pipe`.
 - Cancel scheduled/in-flight boots and restarts during shutdown; bound retries per cell/runtime.

@@ -8,6 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { bootCell, callTool, CellTimeoutError, shutdownCell } from '../dist/cell-loader.js';
 import { HelaRuntime } from '../dist/daemon.js';
+import { buildDigest, ManifestStore } from '../dist/manifest.js';
 
 const fixture = new URL('./fixtures/mcp-cell.mjs', import.meta.url);
 const sandboxes = [];
@@ -23,6 +24,10 @@ function sandbox(mode = 'normal', ids = ['hela-fixture']) {
   });
   writeFileSync(path.join(root, 'config', 'inventory.json'), JSON.stringify({ inventory: Object.fromEntries(specs.map((s) => [s.id, s])) }));
   writeFileSync(path.join(root, 'config', 'profiles.json'), JSON.stringify({ profiles: [{ id: 'dev-workspace', servers: ids }] }));
+  writeFileSync(path.join(root, 'config', 'tool-catalog.json'), JSON.stringify({ format: 1, cells: Object.fromEntries(specs.map((spec, index) => [spec.id, {
+    digest: buildDigest(root, spec), variants: [{ features: {}, tools: (index === 0 ? ['echo', 'hang', 'hold', 'crash', 'agent_run'] : [])
+      .map(name => ({ name, inputSchema: { type: 'object' } })) }],
+  }])) }));
   const box = { root, specs, manifestPath: path.join(root, 'manifest.json') };
   sandboxes.push(box);
   return box;
@@ -48,7 +53,7 @@ function assertGone(pid) {
 }
 
 async function connectRuntime(t, box, overrides = {}) {
-  const rt = new HelaRuntime({ ...box, bootTimeoutMs: 200, toolTimeoutMs: 100, agentTimeoutMs: 100, shutdownGraceMs: 80, restartDelayMs: 40, ...overrides });
+  const rt = new HelaRuntime({ ...box, bootTimeoutMs: 500, toolTimeoutMs: 100, agentTimeoutMs: 100, shutdownGraceMs: 80, restartDelayMs: 40, ...overrides });
   t.after(() => rt.shutdown());
   const client = new Client({ name: 'isolated-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -169,8 +174,10 @@ test('shutdown cancels queued crash restart', { timeout: 10000 }, async (t) => {
   assert.equal(events(box).filter((e) => e.event === 'spawn').length, 1);
 });
 
-test('shutdown cancels all staggered background startup timers', { timeout: 10000 }, async (t) => {
+test('uninvoked cells never start in the background', { timeout: 10000 }, async (t) => {
   const { box, rt } = await runtime(t, 'normal', {}, ['hela-a', 'hela-b', 'hela-c']);
+  await sleep(450);
+  assert.equal(rt.cells.size, 0);
   await rt.shutdown();
   await rt.boot();
   await sleep(450);
@@ -196,6 +203,7 @@ test('shutdown aborts and reaps in-flight initialization without a late boot', {
 for (const mode of ['boot-hang', 'boot-fail', 'crash-loop']) {
   test(`${mode}: initial boot plus exactly three bounded retries, all children reaped`, { timeout: 10000 }, async (t) => {
     const { box, rt } = await runtime(t, mode, { restartDelayMs: 20 });
+    void rt.ensureCell('hela-fixture');
     await until(() => rt.deadCells.has('hela-fixture'), 'retry exhaustion');
     assert.equal(rt.restartAttempts.get('hela-fixture'), 3);
     const started = events(box).filter((e) => e.event === 'spawn');
@@ -225,6 +233,11 @@ for (const namespaced of [false, true]) {
       'hela-mitosis': [tool('agent_run')],
       'hela-ghost': [tool('ghost_tool')],
     }));
+    const store = new ManifestStore(box.manifestPath, box.root, 'dev-workspace', namespaced);
+    for (const spec of box.specs) {
+      store.save(spec.id, store.identity({ ...spec, env: [], lazy: false }).fingerprint,
+        [tool(spec.id === 'hela-fixture' ? 'echo' : spec.id === 'hela-outside' ? 'forbidden_tool' : 'agent_run')]);
+    }
     const { rt, client } = await connectRuntime(t, box, { namespaced });
     assert.deepEqual([...rt.specs.keys()], ['hela-fixture']);
     assert.deepEqual([...rt.lazyCells], ['hela-fixture']);
@@ -267,6 +280,129 @@ test('explicit all-cells mode supports standalone inventories without profiles',
   const response = await client.callTool({ name: 'echo' });
   assert.equal(response.isError, undefined);
   assert.deepEqual([...rt.specs.keys()], ['hela-fixture']);
+});
+
+for (const namespaced of [false, true]) {
+  test(`cold discovery and concurrent first calls stay truly lazy; warm cache works (namespaced=${namespaced})`, { timeout: 10000 }, async (t) => {
+    const box = sandbox('normal', ['hela-fixture', 'hela-unused']);
+    const { rt, client } = await connectRuntime(t, box, { namespaced, bootTimeoutMs: 1000 });
+    await sleep(250);
+    const listed = (await client.listTools()).tools;
+    assert.equal(rt.manifestSources.get('hela-fixture'), 'catalog');
+    assert.equal(rt.cells.size, 0);
+    assert.deepEqual(events(box), []);
+    const name = namespaced ? 'hela_fixture_echo' : 'echo';
+    assert.ok(listed.some(tool => tool.name === name));
+    for (const unknown of ['missing_tool', namespaced ? 'echo' : 'hela_fixture_echo']) {
+      await assert.rejects(client.callTool({ name: unknown }), /Unknown tool/);
+    }
+    assert.equal(rt.cells.size, 0);
+    const coldStart = performance.now();
+    const responses = await Promise.all(Array.from({ length: 24 }, () => client.callTool({ name })));
+    const coldMs = performance.now() - coldStart;
+    assert.ok(responses.every(response => !response.isError));
+    assert.equal(new Set(responses.map(response => JSON.parse(response.content[0].text).pid)).size, 1);
+    assert.equal(events(box).filter(event => event.event === 'spawn').length, 1);
+    assert.deepEqual(events(box, 'hela-unused'), []);
+    const warmStart = performance.now();
+    await client.callTool({ name });
+    t.diagnostic(`cold/concurrent=${coldMs.toFixed(2)}ms warm=${(performance.now() - warmStart).toFixed(2)}ms boot=${rt.cellStartupMs.get('hela-fixture').toFixed(2)}ms`);
+    await rt.shutdown();
+    const warm = await connectRuntime(t, box, { namespaced });
+    assert.equal(warm.rt.manifestSources.get('hela-fixture'), 'cache');
+    assert.equal(warm.rt.cells.size, 0);
+    await warm.client.callTool({ name });
+    assert.equal(events(box).filter(event => event.event === 'spawn').length, 2);
+  });
+}
+
+for (const change of ['revision', 'version', 'build', 'environment', 'features']) {
+  test(`manifest cache invalidates on ${change} without stale advertisement or eager startup`, { timeout: 10000 }, async (t) => {
+    const box = sandbox();
+    const inherited = process.env.TODO103_FIXTURE_OPTION;
+    t.after(() => {
+      if (inherited === undefined) delete process.env.TODO103_FIXTURE_OPTION;
+      else process.env.TODO103_FIXTURE_OPTION = inherited;
+    });
+    const inventoryFile = path.join(box.root, 'config/inventory.json');
+    const inventory = JSON.parse(readFileSync(inventoryFile, 'utf8'));
+    const spec = inventory.inventory['hela-fixture'];
+    spec.env = ['TODO103_FIXTURE_OPTION'];
+    writeFileSync(inventoryFile, JSON.stringify(inventory));
+    const first = await connectRuntime(t, box);
+    await first.client.callTool({ name: 'echo' });
+    await first.rt.shutdown();
+    if (change === 'revision') spec.revision = 'changed-revision';
+    if (change === 'version') spec.version = '99.0.0';
+    if (change === 'build') {
+      const file = path.join(box.root, spec.dir, spec.entry);
+      writeFileSync(file, readFileSync(file, 'utf8') + '\nvoid 0;\n');
+    }
+    if (change === 'environment') process.env.TODO103_FIXTURE_OPTION = 'synthetic-value-must-not-be-persisted';
+    if (change === 'features') spec.toolFeatures = { TODO103_FIXTURE_ENABLED: { default: true } };
+    writeFileSync(inventoryFile, JSON.stringify(inventory));
+    const second = await connectRuntime(t, box);
+    assert.notEqual(second.rt.manifestSources.get(spec.id), 'cache');
+    assert.equal(second.rt.cells.size, 0);
+    if (change !== 'environment') {
+      const tools = (await second.client.listTools()).tools;
+      assert.deepEqual(tools.map(tool => tool.name), ['hela.pipe']);
+      await assert.rejects(second.client.callTool({ name: 'echo' }), /Unknown tool/);
+      assert.equal(events(box).filter(event => event.event === 'spawn').length, 1);
+    } else {
+      assert.equal(second.rt.manifestSources.get(spec.id), 'catalog');
+      await second.client.callTool({ name: 'echo' });
+      assert.ok(!readFileSync(box.manifestPath, 'utf8').includes('synthetic-value-must-not-be-persisted'));
+    }
+  });
+}
+
+test('switching profiles, roots, and namespace modes cannot reuse another cache identity', { timeout: 10000 }, async (t) => {
+  const box = sandbox();
+  const profiles = { profiles: [
+    { id: 'dev-workspace', servers: ['hela-fixture'] },
+    { id: 'minimal', servers: ['hela-fixture'] },
+  ] };
+  writeFileSync(path.join(box.root, 'config/profiles.json'), JSON.stringify(profiles));
+  const initial = await connectRuntime(t, box);
+  await initial.client.callTool({ name: 'echo' });
+  await initial.rt.shutdown();
+  for (const overrides of [{ profile: 'minimal' }, { namespaced: true }]) {
+    const next = await connectRuntime(t, box, overrides);
+    assert.equal(next.rt.manifestSources.get('hela-fixture'), 'catalog');
+    assert.equal(next.rt.cells.size, 0);
+    await next.rt.shutdown();
+  }
+  const other = sandbox();
+  const next = await connectRuntime(t, { ...other, manifestPath: box.manifestPath });
+  assert.equal(next.rt.manifestSources.get('hela-fixture'), 'catalog');
+  assert.equal(next.rt.cells.size, 0);
+});
+
+for (const content of ['{"hela-fixture":[{"name":"obsolete"}]}', '{broken', '{"format":2,"profiles":null}']) {
+  test(`legacy or corrupt caches recover from the catalog (${content.length} bytes)`, async (t) => {
+    const box = sandbox();
+    writeFileSync(box.manifestPath, content);
+    const { rt, client } = await connectRuntime(t, box);
+    assert.equal(rt.manifestSources.get('hela-fixture'), 'catalog');
+    assert.ok(!(await client.listTools()).tools.some(tool => tool.name === 'obsolete'));
+    assert.deepEqual(events(box), []);
+  });
+}
+
+test('missing catalog is explicit and pipe can discover only its named cell on demand', async (t) => {
+  const box = sandbox('normal', ['hela-fixture', 'hela-unused']);
+  unlinkSync(path.join(box.root, 'config/tool-catalog.json'));
+  const { rt, client } = await connectRuntime(t, box);
+  assert.equal(rt.manifestSources.get('hela-fixture'), 'missing');
+  assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['hela.pipe']);
+  await assert.rejects(client.callTool({ name: 'echo' }), /Unknown tool/);
+  assert.equal(rt.cells.size, 0);
+  const response = await client.callTool({ name: 'hela.pipe', arguments: { steps: [{ cell: 'hela-fixture', tool: 'echo' }] } });
+  assert.equal(response.isError, undefined);
+  assert.deepEqual([...rt.cells.keys()], ['hela-fixture']);
+  assert.deepEqual(events(box, 'hela-unused'), []);
+  assert.ok((await client.listTools()).tools.some(tool => tool.name === 'echo'));
 });
 
 test('all fixture PIDs are reaped and default manifest cache remains untouched', (t) => {

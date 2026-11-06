@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { VERSION } from './version.js';
 
 export interface HttpAdapterOptions {
   port?: number;
@@ -26,7 +27,7 @@ export class HttpAdapter {
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', transport: 'http', version: '1.1.0' }));
+        res.end(JSON.stringify({ status: 'ok', transport: 'http', version: VERSION }));
         return;
       }
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/mcp')) {
