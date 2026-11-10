@@ -51,7 +51,7 @@ Keep the output link for deployed packages as a garbage-collection root. Node de
 
 ### 3. Run
 ```bash
-node dist/index.js                              # dev-workspace profile (default, 8 cells)
+node dist/index.js                              # minimal profile (default, 3 cells)
 node dist/index.js --transport http --port 8090   # /mcp and /healthz on one HTTP listener
 HELA_PROFILE=minimal node dist/index.js          # 3 cells only
 HELA_PROFILE=all node dist/index.js              # all 10 cells
@@ -70,7 +70,7 @@ This builds all profile cells + the daemon and writes a single-entry client conf
 
 ## Profile-Aware by Default
 
-The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Default is `dev-workspace`.
+The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Default is `minimal`; choose another profile explicitly when needed.
 
 | Profile | Eligible cells (started only when invoked) |
 |---|---|
@@ -84,6 +84,8 @@ The runtime respects `HELA_PROFILE` exactly like the ecosystem installer. Defaul
 | `all` | all 10 cells |
 
 Discovery is profile-scoped, including cached manifests; an unknown profile fails instead of silently booting every cell. Tool counts depend on enabled cell features, so use `tools/list` rather than a static total. Profiles select eligible cells, not processes that must all run at startup. Standalone MCP servers retain their existing behavior.
+
+The runtime is also the profile-aware instruction boundary. It exposes the current selection through the `hela://profile/context` resource and the `hela-profile-bootstrap` MCP prompt. These are rendered from the selected profile and inventory at runtime, so clients do not need copied `AGENTS.md`/persona files or separate per-cell MCP deployments. The prompt and resource are read-only metadata; they do not start cells.
 
 ### Discovery without starting cells
 
@@ -106,7 +108,7 @@ If neither catalog nor valid cache covers a cell, its tools are not falsely adve
 | Variable | Default | Description |
 |---|---|---|
 | `HELA_ECOSYSTEM_ROOT` | sibling `hela-mcp-ecosystem` | Path to the ecosystem root (inventory, profiles). |
-| `HELA_PROFILE` | `dev-workspace` | Profile id selecting which cells to boot. |
+| `HELA_PROFILE` | `minimal` | Profile id selecting which cells to boot. |
 | `HELA_NAMESPACE_TOOLS` | unset | Set to `1` to expose tools as `hela_<cell>_<tool>`. |
 | `HELA_HTTP_PORT` | unset | Enable HTTP `/healthz` endpoint on this port. |
 

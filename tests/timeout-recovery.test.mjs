@@ -23,7 +23,10 @@ function sandbox(mode = 'normal', ids = ['hela-fixture']) {
     return { id, alias: id, source: 'isolated-fixture', dir: `cells/${id}`, entry: `${mode}.mjs` };
   });
   writeFileSync(path.join(root, 'config', 'inventory.json'), JSON.stringify({ inventory: Object.fromEntries(specs.map((s) => [s.id, s])) }));
-  writeFileSync(path.join(root, 'config', 'profiles.json'), JSON.stringify({ profiles: [{ id: 'dev-workspace', servers: ids }] }));
+  writeFileSync(path.join(root, 'config', 'profiles.json'), JSON.stringify({ profiles: [
+    { id: 'minimal', name: 'Fixture Minimal', servers: ids },
+    { id: 'dev-workspace', name: 'Fixture Workspace', servers: ids },
+  ] }));
   writeFileSync(path.join(root, 'config', 'tool-catalog.json'), JSON.stringify({ format: 1, cells: Object.fromEntries(specs.map((spec, index) => [spec.id, {
     digest: buildDigest(root, spec), variants: [{ features: {}, tools: (index === 0 ? ['echo', 'hang', 'hold', 'crash', 'agent_run'] : [])
       .map(name => ({ name, inputSchema: { type: 'object' } })) }],
@@ -53,7 +56,7 @@ function assertGone(pid) {
 }
 
 async function connectRuntime(t, box, overrides = {}) {
-  const rt = new HelaRuntime({ ...box, bootTimeoutMs: 500, toolTimeoutMs: 100, agentTimeoutMs: 100, shutdownGraceMs: 80, restartDelayMs: 40, ...overrides });
+  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', bootTimeoutMs: 500, toolTimeoutMs: 100, agentTimeoutMs: 100, shutdownGraceMs: 80, restartDelayMs: 40, ...overrides });
   t.after(() => rt.shutdown());
   const client = new Client({ name: 'isolated-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -68,7 +71,47 @@ async function runtime(t, mode = 'normal', overrides = {}, ids) {
 }
 
 test('test runner removes inherited environment hooks and credentials', () => {
-  assert.deepEqual(Object.keys(process.env).filter((key) => key !== 'NODE_TEST_CONTEXT').sort(), ['HOME', 'PATH', 'TMPDIR', 'XDG_CACHE_HOME']);
+  assert.deepEqual(Object.keys(process.env)
+    .filter((key) => !['NODE_TEST_CONTEXT', 'NODE_TEST_WORKER_ID'].includes(key)).sort(), ['HOME', 'PATH', 'TMPDIR', 'XDG_CACHE_HOME']);
+});
+
+test('runtime defaults to the minimal profile when no profile is selected', { timeout: 10000 }, async (t) => {
+  const box = sandbox();
+  const rt = new HelaRuntime({ ...box, bootTimeoutMs: 500, toolTimeoutMs: 100, shutdownGraceMs: 80 });
+  t.after(() => rt.shutdown());
+  const client = new Client({ name: 'isolated-default-test', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await rt.server.connect(serverTransport);
+  await client.connect(clientTransport);
+  await rt.boot();
+  assert.equal(rt.profile, 'minimal');
+  const resource = await client.readResource({ uri: 'hela://profile/context' });
+  assert.match(resource.contents[0].text, /Profile:\*\* `minimal`/);
+});
+
+test('runtime exposes profile context as a prompt and resource without starting cells', { timeout: 10000 }, async (t) => {
+  const box = sandbox('normal', ['hela-fixture', 'hela-unused']);
+  writeFileSync(path.join(box.root, 'config', 'profiles.json'), JSON.stringify({ profiles: [{
+    id: 'dev-workspace', name: 'Fixture Workspace', system: 'test', persona: 'Fixture operator', servers: ['hela-fixture'],
+  }] }));
+  const { rt, client } = await connectRuntime(t, box);
+
+  const prompts = await client.listPrompts();
+  assert.deepEqual(prompts.prompts.map((prompt) => prompt.name), ['hela-profile-bootstrap']);
+  const prompt = await client.getPrompt({ name: 'hela-profile-bootstrap', arguments: { focus: 'Verify the selected runtime boundary.' } });
+  const promptText = prompt.messages[0].content.type === 'text' ? prompt.messages[0].content.text : '';
+  assert.match(promptText, /Fixture Workspace/);
+  assert.match(promptText, /hela-fixture/);
+  assert.match(promptText, /Verify the selected runtime boundary/);
+  assert.match(promptText, /do not connect to or deploy individual/);
+
+  const resources = await client.listResources();
+  assert.deepEqual(resources.resources.map((resource) => resource.uri), ['hela://profile/context']);
+  const resource = await client.readResource({ uri: 'hela://profile/context' });
+  assert.match(resource.contents[0].text, /Fixture operator/);
+  assert.match(resource.contents[0].text, /hela-unused/);
+  assert.equal(rt.cells.size, 0);
+  assert.deepEqual(events(box), []);
 });
 
 test('loader timeout rejects all pending RPCs; SIGTERM escalates to SIGKILL and reaps actual PID', { timeout: 10000 }, async (t) => {

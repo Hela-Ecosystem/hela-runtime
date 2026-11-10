@@ -3,6 +3,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
   McpError,
   ErrorCode,
   type Tool,
@@ -15,6 +19,13 @@ import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 import { ManifestStore } from './manifest.js';
 import { VERSION } from './version.js';
+import {
+  loadProfileContext,
+  PROFILE_PROMPT_NAME,
+  PROFILE_RESOURCE_URI,
+  renderProfileContext,
+  renderProfilePrompt,
+} from './profile-context.js';
 
 export interface RuntimeOptions {
   root?: string;
@@ -73,7 +84,7 @@ export class HelaRuntime {
 
   constructor(private readonly options: RuntimeOptions = {}) {
     this.root = options.root ?? ecosystemRoot();
-    this.profile = options.profile === undefined ? process.env.HELA_PROFILE || 'dev-workspace' : options.profile;
+    this.profile = options.profile === undefined ? process.env.HELA_PROFILE || 'minimal' : options.profile;
     this.namespaced = options.namespaced ?? process.env.HELA_NAMESPACE_TOOLS === '1';
     this.server = this.createServer();
   }
@@ -81,8 +92,16 @@ export class HelaRuntime {
   createServer(): Server {
     return new Server(
       { name: 'hela-runtime', version: VERSION },
-      { capabilities: { tools: {} } },
+      { capabilities: { tools: {}, prompts: {}, resources: {} } },
     );
+  }
+
+  private profileContext() {
+    const toolsByCell = Object.fromEntries(Object.entries(this.cachedManifest).map(([cell, tools]) => [
+      cell,
+      tools.map((tool) => tool.name),
+    ]));
+    return loadProfileContext(this.root, this.profile, toolsByCell);
   }
 
   private selectedSpecs(): CellSpec[] {
@@ -334,6 +353,57 @@ export class HelaRuntime {
   }
 
   attachHandlers(server: Server): void {
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: [{
+        uri: PROFILE_RESOURCE_URI,
+        name: 'HeLa runtime profile context',
+        description: 'Current profile, active organelles, boundaries, and available runtime tools.',
+        mimeType: 'text/markdown',
+      }],
+    }));
+
+    server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+      if (req.params.uri !== PROFILE_RESOURCE_URI) {
+        throw new McpError(ErrorCode.InvalidRequest, `Unknown resource: ${req.params.uri}`);
+      }
+      return {
+        contents: [{
+          uri: PROFILE_RESOURCE_URI,
+          mimeType: 'text/markdown',
+          text: renderProfileContext(this.profileContext()),
+        }],
+      };
+    });
+
+    server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+      prompts: [{
+        name: PROFILE_PROMPT_NAME,
+        description: 'Load the current profile-aware HeLa runtime instructions without creating workspace files.',
+        arguments: [{
+          name: 'focus',
+          description: 'Optional task-specific focus to append to the runtime instructions.',
+          required: false,
+        }],
+      }],
+    }));
+
+    server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+      if (req.params.name !== PROFILE_PROMPT_NAME) {
+        throw new McpError(ErrorCode.InvalidRequest, `Unknown prompt: ${req.params.name}`);
+      }
+      const focus = req.params.arguments?.focus;
+      if (focus !== undefined && typeof focus !== 'string') {
+        throw new McpError(ErrorCode.InvalidParams, 'Prompt argument "focus" must be a string');
+      }
+      return {
+        description: 'Profile-aware HeLa runtime instructions',
+        messages: [{
+          role: 'user',
+          content: { type: 'text', text: renderProfilePrompt(this.profileContext(), focus) },
+        }],
+      };
+    });
+
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools: Tool[] = [];
       const seen = new Set<string>();
