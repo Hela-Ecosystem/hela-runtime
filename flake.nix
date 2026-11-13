@@ -44,7 +44,7 @@
                 && !(pkgs.lib.hasPrefix "memory.db-" name)
                 && !(pkgs.lib.hasPrefix "result-" name);
             };
-            npmDepsHash = "sha256-z8bzLcnbu8U/7TZ5JwTU+mH2Zjt0pJXAWiHKsmlm1Sw=";
+            npmDepsHash = "sha256-ySKFNnhQHP1Wkr0KMox2pheSV6X69F6QDadxLv+13NI=";
             npmFlags = [ "--ignore-scripts" ];
             meta = {
               mainProgram = "hela-runtime";
