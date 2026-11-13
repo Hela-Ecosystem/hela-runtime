@@ -18,6 +18,7 @@ import os from 'node:os';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 import { ManifestStore } from './manifest.js';
+import { NativeNeedleAgent, scoreTools, type AgentContext, type AgentTool } from './agent.js';
 import { VERSION } from './version.js';
 import {
   loadProfileContext,
@@ -81,12 +82,55 @@ export class HelaRuntime {
   private manifests!: ManifestStore;
   manifestSources = new Map<string, 'cache' | 'catalog' | 'missing'>();
   cellStartupMs = new Map<string, number>();
+  nativeAgent?: NativeNeedleAgent;
+  nativeAgentEnabled = process.env.HELA_NATIVE_AGENT !== 'false';
+  nativeAgentReady = false;
 
   constructor(private readonly options: RuntimeOptions = {}) {
     this.root = options.root ?? ecosystemRoot();
     this.profile = options.profile === undefined ? process.env.HELA_PROFILE || 'minimal' : options.profile;
     this.namespaced = options.namespaced ?? process.env.HELA_NAMESPACE_TOOLS === '1';
     this.server = this.createServer();
+  }
+
+  /** Build the complete, live tool catalog across every selected cell. */
+  agentCatalog(): AgentTool[] {
+    const excluded = /^(agent_run|hela\.agent\.run|hela\.agent\.plan|hela\.catalog\.list|hela\.catalog\.search|hela\.pipe|workflow_orchestrator|workflow_status|workflow_cancel|validate_tool_chain|analyze_tool_chain_performance|analyze_tools|generate_route_suggestions|get_tool_chain_analysis|suggest_skill_chain|llm_.*|brainstorming|sequentialthinking|list_mcp_servers|search_instructions|load_instruction|get_prompt|search_prompts|get_resource_set|search_resource_sets|agent_(spawn|send|fork|list|info|close|create))$/;
+    const seen = new Set<string>();
+    const catalog: AgentTool[] = [];
+    for (const [cellKey, cached] of Object.entries(this.cachedManifest)) {
+      if (!this.specs.has(cellKey) || this.deadCells.has(cellKey)) continue;
+      const live = this.cells.get(cellKey)?.ready ? [...this.cells.get(cellKey)!.tools.values()] : cached;
+      const short = cellKey.replace(/^hela-/, '');
+      for (const tool of live) {
+        const exposed = this.namespaced ? `hela_${short}_${tool.name}` : tool.name;
+        if (seen.has(exposed) || excluded.test(exposed) || excluded.test(tool.name)) continue;
+        seen.add(exposed);
+        catalog.push({ name: exposed, cell: cellKey, realName: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+      }
+    }
+    return catalog;
+  }
+
+  async executeAgentTool(tool: AgentTool, args: Record<string, unknown>): Promise<unknown> {
+    let cell = this.cells.get(tool.cell);
+    if (!cell?.ready) cell = await this.ensureCell(tool.cell);
+    if (!cell?.ready) throw new Error(`Cell not ready: ${tool.cell}`);
+    const realName = this.toolToReal.get(tool.name) ?? tool.realName;
+    if (!cell.tools.has(realName)) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
+    const response = await callTool(cell, realName, args, this.options.toolTimeoutMs ?? 60000);
+    return response?.result ?? response?.content ?? response;
+  }
+
+  agentContext(): AgentContext {
+    // The ecosystem root holds the cell sources, not user data. launch.mjs
+    // starts the daemon in the installation workspace and exports it as
+    // GUARDIAN_PROJECT_ROOT, so prefer those over <root>/workspace (which
+    // does not exist in installed layouts).
+    const workspace = process.env.HELA_WORKSPACE
+      || process.env.GUARDIAN_PROJECT_ROOT
+      || (fs.existsSync(path.join(this.root, 'workspace')) ? path.join(this.root, 'workspace') : process.cwd());
+    return { workspaceRoot: workspace, cwd: workspace };
   }
 
   createServer(): Server {
@@ -256,7 +300,20 @@ export class HelaRuntime {
     }
     console.error(`[hela-runtime] profile=${this.profile ?? 'all'} cells=${specs.length} mode=on-demand`);
 
-    // agent host alias (will be set when mitosis boots, handled in CallTool)
+    if (this.nativeAgentEnabled) {
+      this.nativeAgent = new NativeNeedleAgent(this, {
+        root: this.root,
+        profile: this.profile,
+        needleTimeoutMs: parseInt(process.env.NEEDLE_TIMEOUT_MS || '30000', 10),
+      });
+      const health = this.nativeAgent.health();
+      // Only advertise the native agent when its engine and weights exist.
+      // Fixture runtimes have no Needle assets and must keep the cell-local
+      // agent_run contract untouched.
+      this.nativeAgentReady = health.ok;
+      console.error(`[hela-runtime] native agent ${health.ok ? 'ready' : 'unavailable'}: ${health.detail ?? `${health.engine}${health.model ? ` + ${health.model}` : ''}`}`);
+    }
+
     // cross-cell pipe (runtime-internal chaining)
     this.toolToCell.set('hela.pipe', '__runtime__');
     this.toolToReal.set('hela.pipe', 'hela.pipe');
@@ -352,6 +409,53 @@ export class HelaRuntime {
     return { content: [{ type: 'text', text: JSON.stringify({ ok: true, steps: results.length, results }, null, 2) }] };
   }
 
+  private jsonResult(value: unknown): { content: Array<{ type: string; text: string }>; isError?: boolean } {
+    const failed = Boolean(value && typeof value === 'object' && (value as Record<string, unknown>).ok === false);
+    return {
+      content: [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+      ...(failed ? { isError: true } : {}),
+    };
+  }
+
+  private catalogList(args: Record<string, unknown>): Record<string, unknown> {
+    const catalog = this.agentCatalog();
+    const cell = typeof args.cell === 'string' ? args.cell.trim() : '';
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    let tools = cell ? catalog.filter((tool) => tool.cell === cell || tool.cell === `hela-${cell}`) : catalog;
+    if (query) tools = scoreTools(tools, query).map((entry) => entry.tool);
+    const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.min(300, Math.floor(Number(args.limit)))) : undefined;
+    const cells = [...new Set(catalog.map((tool) => tool.cell))];
+    return {
+      ok: true,
+      total: catalog.length,
+      count: tools.length,
+      cells: cells.map((id) => ({ id, tools: catalog.filter((tool) => tool.cell === id).length })),
+      tools: (limit ? tools.slice(0, limit) : tools).map((tool) => ({
+        name: tool.name,
+        cell: tool.cell,
+        description: tool.description,
+      })),
+    };
+  }
+
+  private catalogSearch(args: Record<string, unknown>): Record<string, unknown> {
+    const query = String(args.query ?? '').trim();
+    if (!query) return { ok: false, error: 'query is required' };
+    const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.min(50, Math.floor(Number(args.limit)))) : 10;
+    const ranked = scoreTools(this.agentCatalog(), query).slice(0, limit);
+    return {
+      ok: true,
+      query,
+      total: this.agentCatalog().length,
+      matches: ranked.map((entry) => ({
+        name: entry.tool.name,
+        cell: entry.tool.cell,
+        score: Math.round(entry.score * 100) / 100,
+        description: entry.tool.description,
+      })),
+    };
+  }
+
   attachHandlers(server: Server): void {
     server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       resources: [{
@@ -436,13 +540,83 @@ export class HelaRuntime {
         }
       }
 
-      // agent host alias
-      const mitosisCell = this.cells.get('hela-mitosis');
-      const agentTool = this.specs.has('hela-mitosis') && !this.deadCells.has('hela-mitosis')
-        ? mitosisCell?.tools.get('agent_run') ?? this.cachedManifest['hela-mitosis']?.find((t) => t.name === 'agent_run')
-        : undefined;
-      if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
-        tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: (agentTool as any).inputSchema });
+      // Runtime-native Needle agent. This shadows the cell-local agent_run:
+      // Mitosis can only discover its own tools, while the runtime can see
+      // every cell. The agent plans over the complete catalog and executes
+      // in-process, so it works with the bundled Needle 3 and no API key.
+      if (this.nativeAgentEnabled && this.nativeAgentReady && this.nativeAgent) {
+        const agentInputSchema = {
+          type: 'object' as const,
+          properties: {
+            task: { type: 'string', description: 'The task or objective for the agent to accomplish' },
+            maxIterations: { type: 'number', minimum: 1, maximum: 20, default: 8, description: 'Maximum decide-act-observe iterations' },
+            maxToolCalls: { type: 'number', minimum: 1, maximum: 30, default: 12, description: 'Maximum tool executions per run' },
+            maxExecutionMs: { type: 'number', minimum: 1000, maximum: 300000, default: 180000, description: 'Maximum run wall-clock time in milliseconds' },
+          },
+          required: ['task'],
+        };
+        const description = 'Runtime-native Needle agent: retrieves relevant tools from the full aggregated catalog, plans with the bundled Needle 3 model, repairs arguments against each JSON Schema, and executes cell tools in-process. No OpenRouter key required. This supersedes the cell-local Mitosis agent_run.';
+        const existing = tools.find((tool) => tool.name === 'agent_run');
+        if (existing) Object.assign(existing, { description, inputSchema: agentInputSchema });
+        else tools.push({ name: 'agent_run', description, inputSchema: agentInputSchema });
+        if (!tools.find((tool) => tool.name === 'hela.agent.run')) {
+          tools.push({ name: 'hela.agent.run', description, inputSchema: agentInputSchema });
+        }
+        if (!tools.find((tool) => tool.name === 'hela.agent.plan')) {
+          tools.push({
+            name: 'hela.agent.plan',
+            description: 'Inspect the runtime-native agent plan for a task: the deterministic step plan plus the tools retrieved from the full catalog. Read-only; no tool execution.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                task: { type: 'string', description: 'The task to plan' },
+                limit: { type: 'number', minimum: 1, maximum: 20, default: 8, description: 'Maximum retrieved tools to return' },
+              },
+              required: ['task'],
+            },
+          });
+        }
+        if (!tools.find((tool) => tool.name === 'hela.catalog.list')) {
+          tools.push({
+            name: 'hela.catalog.list',
+            description: 'List the runtime\'s complete aggregated tool catalog, optionally filtered by cell or ranked by a query. Use this to verify that the runtime sees all cells.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                cell: { type: 'string', description: 'Optional cell id filter, e.g. hela-cytosol' },
+                query: { type: 'string', description: 'Optional retrieval query to rank tools' },
+                limit: { type: 'number', minimum: 1, maximum: 300, description: 'Maximum tools to return' },
+              },
+            },
+          });
+        }
+        if (!tools.find((tool) => tool.name === 'hela.catalog.search')) {
+          tools.push({
+            name: 'hela.catalog.search',
+            description: 'Rank the runtime\'s complete aggregated tool catalog against a query. Read-only; returns names, cells, scores and descriptions.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'What capability to search for' },
+                limit: { type: 'number', minimum: 1, maximum: 50, default: 10, description: 'Maximum matches' },
+              },
+              required: ['query'],
+            },
+          });
+        }
+      }
+
+      // Legacy agent host alias. When the native agent cannot run (no Needle
+      // assets, or HELA_NATIVE_AGENT=false) keep routing hela.agent.run to the
+      // Mitosis agent_run exactly as before.
+      if (!this.nativeAgentReady) {
+        const mitosisCell = this.cells.get('hela-mitosis');
+        const agentTool = this.specs.has('hela-mitosis') && !this.deadCells.has('hela-mitosis')
+          ? mitosisCell?.tools.get('agent_run') ?? this.cachedManifest['hela-mitosis']?.find((t) => t.name === 'agent_run')
+          : undefined;
+        if (agentTool && !tools.find((t) => t.name === 'hela.agent.run')) {
+          tools.push({ name: 'hela.agent.run', description: 'Run a task through the HeLa agent host (Needle).', inputSchema: (agentTool as any).inputSchema });
+        }
       }
 
       if (!tools.find((t) => t.name === 'hela.pipe')) {
@@ -477,12 +651,27 @@ export class HelaRuntime {
       const args = req.params.arguments ?? {};
       if (this.stopping) return { content: [{ type: 'text', text: 'Runtime is shutting down' }], isError: true };
 
+      if (this.nativeAgentEnabled && this.nativeAgentReady && this.nativeAgent) {
+        if (name === 'agent_run' || name === 'hela.agent.run') {
+          return this.jsonResult(await this.nativeAgent.run(args));
+        }
+        if (name === 'hela.agent.plan') {
+          return this.jsonResult(await this.nativeAgent.plan(args));
+        }
+        if (name === 'hela.catalog.list') {
+          return this.jsonResult(this.catalogList(args));
+        }
+        if (name === 'hela.catalog.search') {
+          return this.jsonResult(this.catalogSearch(args));
+        }
+      }
       if (name === 'hela.pipe') {
         return await this.runPipe(args);
       }
-      const agentKnown = this.cells.get('hela-mitosis')?.tools.has('agent_run')
-        || this.cachedManifest['hela-mitosis']?.some(tool => tool.name === 'agent_run');
-      const cellKey = this.toolToCell.get(name) ?? (name === 'hela.agent.run' && agentKnown ? 'hela-mitosis' : undefined);
+      const legacyAgentKnown = this.cells.get('hela-mitosis')?.tools.has('agent_run')
+        || this.cachedManifest['hela-mitosis']?.some((tool) => tool.name === 'agent_run');
+      const cellKey = this.toolToCell.get(name)
+        ?? (name === 'hela.agent.run' && !this.nativeAgentReady && legacyAgentKnown ? 'hela-mitosis' : undefined);
       if (!cellKey || !this.specs.has(cellKey)) {
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }
@@ -496,9 +685,13 @@ export class HelaRuntime {
         }
         return { content: [{ type: 'text', text: `Cell not ready: ${cellKey}` }], isError: true };
       }
-      const targetName = name === 'hela.agent.run' ? 'agent_run' : (this.toolToReal.get(name) ?? name);
+      const targetName = name === 'hela.agent.run' && !this.nativeAgentReady
+        ? 'agent_run'
+        : (this.toolToReal.get(name) ?? name);
       if (!cell.tools.has(targetName)) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
-      const timeout = name === 'hela.agent.run' ? this.options.agentTimeoutMs ?? 120000 : this.options.toolTimeoutMs ?? 60000;
+      const timeout = name === 'hela.agent.run' && !this.nativeAgentReady
+        ? this.options.agentTimeoutMs ?? 120000
+        : this.options.toolTimeoutMs ?? 60000;
       try {
         const res = await callTool(cell, targetName, args, timeout);
         if (res?.result) return res.result;
