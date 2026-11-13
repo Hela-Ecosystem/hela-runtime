@@ -86,6 +86,12 @@ export interface AgentOptions {
 const DONE_TOOL = 'done';
 const MAX_SHORTLIST = 4;
 
+export function needleEngineCandidates(platform = process.platform): string[] {
+  return platform === 'win32'
+    ? ['needle3.exe', 'needle.exe', 'needle3', 'needle']
+    : ['needle3', 'needle'];
+}
+
 function clamp(value: unknown, minimum: number, maximum: number, fallback: number): number {
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -779,8 +785,10 @@ export class NativeNeedleAgent {
 
   constructor(private readonly host: AgentHost, private readonly options: AgentOptions) {
     const dir = path.join(options.root, 'chaining-mcp', 'assets', 'needle');
-    const engine = process.env.NEEDLE_ENGINE_PATH || path.join(dir, 'needle3');
-    this.enginePath = fs.existsSync(engine) ? engine : path.join(dir, 'needle');
+    const candidates = needleEngineCandidates();
+    const configuredEngine = process.env.NEEDLE_ENGINE_PATH;
+    const discoveredEngine = candidates.map((name) => path.join(dir, name)).find((candidate) => fs.existsSync(candidate));
+    this.enginePath = configuredEngine || discoveredEngine || path.join(dir, candidates[0]);
     const model = process.env.NEEDLE_MODEL_PATH || path.join(dir, 'needle3.cact');
     this.modelPath = fs.existsSync(model) ? model : undefined;
     this.systemPath = resolveSystemPath(options.root, options.profile);

@@ -119,6 +119,10 @@ If neither catalog nor valid cache covers a cell, its tools are not falsely adve
 | `NEEDLE_MODEL_PATH` | `<ecosystem>/chaining-mcp/assets/needle/needle3.cact` | Override the Needle model weights. |
 | `NEEDLE_SYSTEM_PATH` | profile system prompt under the Needle assets | Override the system prompt passed to Needle. |
 
+On Windows, the runtime automatically checks `needle3.exe` and `needle.exe` before
+the extensionless Unix names. `NEEDLE_ENGINE_PATH` remains available for custom
+locations.
+
 ---
 
 ## Native Needle Agent

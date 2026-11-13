@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { NativeNeedleAgent, compactParameters, repairArgs, scoreTools, validateArgs } from '../dist/agent.js';
+import { NativeNeedleAgent, compactParameters, needleEngineCandidates, repairArgs, scoreTools, validateArgs } from '../dist/agent.js';
 
 const assetRoot = mkdtempSync(path.join(os.tmpdir(), 'hela-agent-assets-'));
 mkdirSync(path.join(assetRoot, 'chaining-mcp', 'assets', 'needle'), { recursive: true });
@@ -46,6 +46,11 @@ const host = {
 };
 
 test.after(() => rmSync(assetRoot, { recursive: true, force: true }));
+
+test('Windows Needle resolution prefers executable assets', () => {
+  assert.deepEqual(needleEngineCandidates('win32').slice(0, 2), ['needle3.exe', 'needle.exe']);
+  assert.deepEqual(needleEngineCandidates('linux'), ['needle3', 'needle']);
+});
 
 test('negative roster lines are sanitized before reaching Needle', () => {
   const profilePath = path.join(assetRoot, 'profile-not.txt');
