@@ -1,6 +1,6 @@
 # HeLa Runtime
 
-> **HeLa Runtime v1.2.0** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
+> **HeLa Runtime v1.2.1** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
 
 ![Blotcat plugging MCP server cables into the central AI Hub](https://raw.githubusercontent.com/Hela-Ecosystem/.github/main/profile/hela-logo-1024.png)
 
