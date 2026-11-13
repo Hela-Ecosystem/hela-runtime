@@ -21,7 +21,7 @@ Instead of connecting your AI client to 10 separate MCP servers, you connect to 
 * **Starts** only the cell targeted by the first tool call. Discovery starts no cells, and concurrent first calls share one startup.
 * **Recovers** from crashes and tool timeouts after the old process exits, with up to three cumulative retries per cell/runtime and exponential backoff. Hung processes receive SIGTERM followed by SIGKILL if necessary; other cells stay online.
 * **Chains** tool calls in-process via `hela.pipe` (zero host round-trips).
-* **Hosts** agents via `hela.agent.run` (Needle 3 orchestration).
+* **Hosts** agents via `hela.agent.run` — a runtime-native Needle 3 agent that plans over the full aggregated catalog and executes cell tools in-process, with no external API key.
 
 ---
 
@@ -111,6 +111,46 @@ If neither catalog nor valid cache covers a cell, its tools are not falsely adve
 | `HELA_PROFILE` | `minimal` | Profile id selecting which cells to boot. |
 | `HELA_NAMESPACE_TOOLS` | unset | Set to `1` to expose tools as `hela_<cell>_<tool>`. |
 | `HELA_HTTP_PORT` | unset | Enable HTTP `/healthz` endpoint on this port. |
+| `HELA_NATIVE_AGENT` | enabled | Set to `false` to disable the runtime-native Needle agent and restore the legacy cell-local `agent_run` alias. |
+| `HELA_WORKSPACE` | `GUARDIAN_PROJECT_ROOT` or runtime cwd | Workspace used to resolve agent file paths. |
+| `HELA_MEMORY_ENTITY` | `project:hela-dev-workspace-runtime` | Default Genome entity for agent memory observations. |
+| `NEEDLE_TIMEOUT_MS` | `30000` | Per-decision timeout for the bundled Needle engine. |
+| `NEEDLE_ENGINE_PATH` | `<ecosystem>/chaining-mcp/assets/needle/needle3` | Override the Needle executable. |
+| `NEEDLE_MODEL_PATH` | `<ecosystem>/chaining-mcp/assets/needle/needle3.cact` | Override the Needle model weights. |
+| `NEEDLE_SYSTEM_PATH` | profile system prompt under the Needle assets | Override the system prompt passed to Needle. |
+
+---
+
+## Native Needle Agent
+
+When the bundled Needle 3 engine and weights are present, the runtime registers
+`agent_run` / `hela.agent.run` as a runtime-native agent instead of forwarding to
+a single cell. It:
+
+1. Builds the complete catalog from every selected cell (204 tools across the
+   eight `dev-workspace` cells in a typical installation).
+2. Retrieves a four-tool shortlist with lexical BM25 plus intent rules.
+3. Asks Needle 3 to choose the next tool (or `done`) and generate its arguments.
+4. Repairs those arguments against the real JSON Schema, executes the tool
+   in-process, and feeds the observation into the next iteration.
+
+The shortlist keeps each decision inside Needle's 8K context. The runtime also
+passes `--forced` (low-confidence calls otherwise remain suppressed), sanitizes
+`NOT active` roster lines that would trip Needle's negation validator, and falls
+back to deterministic step plans for recognized browser, shell, file, memory,
+and academic intents. No OpenRouter key is used.
+
+Inspection tools:
+
+* `hela.agent.plan` — show the deterministic plan and retrieved tools without
+  executing anything.
+* `hela.catalog.list` — list the complete aggregated catalog, optionally by cell
+  or ranked by query.
+* `hela.catalog.search` — rank catalog tools against a capability query.
+
+If Needle assets are missing, or `HELA_NATIVE_AGENT=false`, the runtime keeps the
+previous behavior: `hela.agent.run` routes to Mitosis's `agent_run` when that
+cell is selected.
 
 ---
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add a runtime-native Needle 3 agent behind `agent_run` / `hela.agent.run`. It retrieves from the full aggregated catalog, plans with the bundled model, repairs arguments against each JSON Schema, and executes cell tools in-process without an OpenRouter key.
+- Add `hela.agent.plan`, `hela.catalog.list`, and `hela.catalog.search` for inspection.
+- Preserve the legacy Mitosis `hela.agent.run` alias when Needle assets are missing or `HELA_NATIVE_AGENT=false`.
+- Document native-agent workspace, memory, and Needle environment settings.
+
 ## 1.2.0
 
 - Start cells on first invocation only, share concurrent startup attempts, and avoid all-cell scanning on unknown calls. Discovery uses a generated ecosystem catalog without starting cells.
