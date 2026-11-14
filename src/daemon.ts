@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
+import { spawn } from 'node:child_process';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 import { ManifestStore } from './manifest.js';
@@ -40,6 +41,32 @@ export interface RuntimeOptions {
   restartDelayMs?: number;
   maxRestartAttempts?: number;
 }
+
+const RUNTIME_UPDATE_CELL = '__runtime__';
+const UPDATE_CHECK_TOOL = 'hela.update.check';
+const UPDATE_APPLY_TOOL = 'hela.update.apply';
+
+const runtimeUpdateTools: AgentTool[] = [
+  {
+    name: UPDATE_CHECK_TOOL,
+    cell: RUNTIME_UPDATE_CELL,
+    realName: UPDATE_CHECK_TOOL,
+    description: 'Read-only check for a newer HeLa ecosystem snapshot. Reports changed cells and never modifies the installation.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: UPDATE_APPLY_TOOL,
+    cell: RUNTIME_UPDATE_CELL,
+    realName: UPDATE_APPLY_TOOL,
+    description: 'Apply the latest verified HeLa ecosystem snapshot. Requires confirm=true, preserves a rollback record, and requires a runtime/client restart afterward.',
+    inputSchema: {
+      type: 'object',
+      properties: { confirm: { type: 'boolean', description: 'Explicitly authorize changing the managed installation.' } },
+      required: ['confirm'],
+      additionalProperties: false,
+    },
+  },
+];
 
 function ecosystemRoot(): string {
   if (process.env.HELA_ECOSYSTEM_ROOT) return process.env.HELA_ECOSYSTEM_ROOT;
@@ -97,7 +124,7 @@ export class HelaRuntime {
   agentCatalog(): AgentTool[] {
     const excluded = /^(agent_run|hela\.agent\.run|hela\.agent\.plan|hela\.catalog\.list|hela\.catalog\.search|hela\.pipe|workflow_orchestrator|workflow_status|workflow_cancel|validate_tool_chain|analyze_tool_chain_performance|analyze_tools|generate_route_suggestions|get_tool_chain_analysis|suggest_skill_chain|llm_.*|brainstorming|sequentialthinking|list_mcp_servers|search_instructions|load_instruction|get_prompt|search_prompts|get_resource_set|search_resource_sets|agent_(spawn|send|fork|list|info|close|create))$/;
     const seen = new Set<string>();
-    const catalog: AgentTool[] = [];
+    const catalog: AgentTool[] = [...runtimeUpdateTools];
     for (const [cellKey, cached] of Object.entries(this.cachedManifest)) {
       if (!this.specs.has(cellKey) || this.deadCells.has(cellKey)) continue;
       const live = this.cells.get(cellKey)?.ready ? [...this.cells.get(cellKey)!.tools.values()] : cached;
@@ -113,6 +140,7 @@ export class HelaRuntime {
   }
 
   async executeAgentTool(tool: AgentTool, args: Record<string, unknown>): Promise<unknown> {
+    if (tool.cell === RUNTIME_UPDATE_CELL) return this.executeRuntimeUpdate(tool.name, args);
     let cell = this.cells.get(tool.cell);
     if (!cell?.ready) cell = await this.ensureCell(tool.cell);
     if (!cell?.ready) throw new Error(`Cell not ready: ${tool.cell}`);
@@ -120,6 +148,50 @@ export class HelaRuntime {
     if (!cell.tools.has(realName)) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
     const response = await callTool(cell, realName, args, this.options.toolTimeoutMs ?? 60000);
     return response?.result ?? response?.content ?? response;
+  }
+
+  private updateControllerPath(): string {
+    return path.join(this.root, 'scripts', 'update-controller.mjs');
+  }
+
+  private async executeRuntimeUpdate(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (name === UPDATE_APPLY_TOOL && args.confirm !== true) {
+      return { ok: false, requiresConfirmation: true, error: 'Applying an update requires confirm=true.' };
+    }
+    if (name !== UPDATE_CHECK_TOOL && name !== UPDATE_APPLY_TOOL) {
+      return { ok: false, error: `Unknown runtime update tool: ${name}` };
+    }
+    const controller = this.updateControllerPath();
+    if (!fs.existsSync(controller)) {
+      return { ok: false, error: `Update controller is not installed at ${controller}` };
+    }
+    const prefix = process.env.HELA_INSTALL_PREFIX || path.dirname(this.root);
+    const command = name === UPDATE_CHECK_TOOL ? 'check' : 'apply';
+    const commandArgs = [controller, command, '--prefix', prefix, '--json'];
+    if (command === 'apply') commandArgs.push('--confirm');
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, commandArgs, {
+        cwd: this.root,
+        env: { ...process.env, HELA_INSTALL_PREFIX: prefix },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+      child.once('error', (error) => resolve({ ok: false, error: error.message }));
+      child.once('close', (code) => {
+        const line = stdout.trim().split('\n').filter(Boolean).pop();
+        if (line) {
+          try {
+            const result = JSON.parse(line) as Record<string, unknown>;
+            resolve(code === 0 ? result : { ...result, ok: false, error: result.error ?? (stderr.trim() || `Update controller exited with ${code}`) });
+            return;
+          } catch { /* fall through to a structured process error */ }
+        }
+        resolve({ ok: false, error: stderr.trim() || `Update controller exited with ${code ?? 'unknown status'}` });
+      });
+    });
   }
 
   agentContext(): AgentContext {
@@ -512,6 +584,11 @@ export class HelaRuntime {
       const tools: Tool[] = [];
       const seen = new Set<string>();
 
+      for (const tool of runtimeUpdateTools) {
+        seen.add(tool.name);
+        tools.push({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+      }
+
       // From booted cells
       for (const cell of this.cells.values()) {
         if (!this.specs.has(cell.key)) continue;
@@ -650,6 +727,10 @@ export class HelaRuntime {
       const name = req.params.name;
       const args = req.params.arguments ?? {};
       if (this.stopping) return { content: [{ type: 'text', text: 'Runtime is shutting down' }], isError: true };
+
+      if (name === UPDATE_CHECK_TOOL || name === UPDATE_APPLY_TOOL) {
+        return this.jsonResult(await this.executeRuntimeUpdate(name, args));
+      }
 
       if (this.nativeAgentEnabled && this.nativeAgentReady && this.nativeAgent) {
         if (name === 'agent_run' || name === 'hela.agent.run') {

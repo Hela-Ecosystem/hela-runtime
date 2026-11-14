@@ -1,6 +1,6 @@
 # HeLa Runtime
 
-> **HeLa Runtime v1.2.1** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
+> **HeLa Runtime v1.3.0** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
 
 ![Blotcat plugging MCP server cables into the central AI Hub](https://raw.githubusercontent.com/Hela-Ecosystem/.github/main/profile/hela-logo-1024.png)
 
@@ -22,6 +22,7 @@ Instead of connecting your AI client to 10 separate MCP servers, you connect to 
 * **Recovers** from crashes and tool timeouts after the old process exits, with up to three cumulative retries per cell/runtime and exponential backoff. Hung processes receive SIGTERM followed by SIGKILL if necessary; other cells stay online.
 * **Chains** tool calls in-process via `hela.pipe` (zero host round-trips).
 * **Hosts** agents via `hela.agent.run` — a runtime-native Needle 3 agent that plans over the full aggregated catalog and executes cell tools in-process, with no external API key.
+* **Controls updates** through `hela.update.check` and confirmation-gated `hela.update.apply`; checks are read-only, updates use the managed snapshot rollback path, and a successful update reports that the runtime/client must restart.
 
 ---
 
@@ -151,6 +152,11 @@ Inspection tools:
 * `hela.catalog.list` — list the complete aggregated catalog, optionally by cell
   or ranked by query.
 * `hela.catalog.search` — rank catalog tools against a capability query.
+
+Update controls:
+
+* `hela.update.check` — compare the managed installation with the remote `latest-stable` snapshot without changing files.
+* `hela.update.apply` — apply the reviewed snapshot only with `confirm: true`; arbitrary installer commands are not exposed to the agent.
 
 If Needle assets are missing, or `HELA_NATIVE_AGENT=false`, the runtime keeps the
 previous behavior: `hela.agent.run` routes to Mitosis's `agent_run` when that

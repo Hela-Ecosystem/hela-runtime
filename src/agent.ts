@@ -413,6 +413,7 @@ function looksLikeCssSelector(value: unknown): boolean {
 }
 
 function intentForTool(name: string): string {
+  if (name === 'hela.update.check' || name === 'hela.update.apply') return 'update';
   if (name === 'execute_command') return 'shell';
   if (name === 'list_directory' || name === 'terminal_ls') return 'list';
   if (name === 'read_file' || name === 'terminal_cat') return 'read';
@@ -462,6 +463,10 @@ function planFor(task: string): PlannedStep[] {
   }
 
   const shellIntent = hasAny(lower, /\b(run|execute|shell|bash|command|npm|pnpm|yarn|test|build|compile|git|diff|status|disk|usage|df|du|process|curl|install|serve)\b/);
+  if (hasAny(lower, /\b(update|upgrade|latest version|new release|outdated)\b/)) {
+    steps.push({ intent: 'update', tool: 'hela.update.check', description: 'check the managed HeLa installation for a newer verified snapshot' });
+    return steps;
+  }
   const localExplore = hasAny(lower, /\b(find|locate|count|inspect|measure)\b/)
     && hasAny(lower, /\b(files?|director(?:y|ies)|source|code|repo(?:sitory)?|runtime|packages?|typescript|\.ts|\.js|\.mjs)\b/);
   if (!browser && (shellIntent || localExplore)) {

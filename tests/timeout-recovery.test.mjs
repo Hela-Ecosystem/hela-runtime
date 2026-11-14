@@ -389,7 +389,7 @@ for (const change of ['revision', 'version', 'build', 'environment', 'features']
     assert.equal(second.rt.cells.size, 0);
     if (change !== 'environment') {
       const tools = (await second.client.listTools()).tools;
-      assert.deepEqual(tools.map(tool => tool.name), ['hela.pipe']);
+      assert.deepEqual(tools.map(tool => tool.name), ['hela.update.check', 'hela.update.apply', 'hela.pipe']);
       await assert.rejects(second.client.callTool({ name: 'echo' }), /Unknown tool/);
       assert.equal(events(box).filter(event => event.event === 'spawn').length, 1);
     } else {
@@ -438,7 +438,7 @@ test('missing catalog is explicit and pipe can discover only its named cell on d
   unlinkSync(path.join(box.root, 'config/tool-catalog.json'));
   const { rt, client } = await connectRuntime(t, box);
   assert.equal(rt.manifestSources.get('hela-fixture'), 'missing');
-  assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['hela.pipe']);
+  assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['hela.update.check', 'hela.update.apply', 'hela.pipe']);
   await assert.rejects(client.callTool({ name: 'echo' }), /Unknown tool/);
   assert.equal(rt.cells.size, 0);
   const response = await client.callTool({ name: 'hela.pipe', arguments: { steps: [{ cell: 'hela-fixture', tool: 'echo' }] } });
@@ -446,6 +446,17 @@ test('missing catalog is explicit and pipe can discover only its named cell on d
   assert.deepEqual([...rt.cells.keys()], ['hela-fixture']);
   assert.deepEqual(events(box, 'hela-unused'), []);
   assert.ok((await client.listTools()).tools.some(tool => tool.name === 'echo'));
+});
+
+test('runtime exposes update controls without exposing arbitrary installer commands', async (t) => {
+  const box = sandbox();
+  const { rt, client } = await connectRuntime(t, box);
+  const tools = (await client.listTools()).tools;
+  assert.deepEqual(tools.filter(tool => tool.name.startsWith('hela.update.')).map(tool => tool.name), ['hela.update.check', 'hela.update.apply']);
+  const denied = await client.callTool({ name: 'hela.update.apply', arguments: { confirm: false } });
+  assert.equal(denied.isError, true);
+  assert.match(denied.content?.[0]?.text ?? '', /confirm=true/);
+  assert.equal(rt.cells.size, 0);
 });
 
 test('all fixture PIDs are reaped and default manifest cache remains untouched', (t) => {

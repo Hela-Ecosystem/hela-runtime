@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0 - 2026-11-14
+
+- Expose read-only `hela.update.check` and confirmation-gated `hela.update.apply` controls through the runtime and native agent catalog.
+- Route update requests through the managed snapshot controller with rollback reporting and an explicit restart-required result.
+- Keep automatic update checks opt-in and check-only; the runtime never grants the agent arbitrary installer shell access.
+
 ## 1.2.1 - 2026-11-13
 
 - Make runtime cleanup platform-neutral through a Node script and discover Windows Needle executables (`needle3.exe` / `needle.exe`) automatically.
