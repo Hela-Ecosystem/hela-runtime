@@ -89,6 +89,50 @@ test('runtime defaults to the minimal profile when no profile is selected', { ti
   assert.match(resource.contents[0].text, /Profile:\*\* `minimal`/);
 });
 
+test('observability tracks calls, readiness follows manifest loading, and logs redact arguments and paths', { timeout: 10000 }, async (t) => {
+  const box = sandbox();
+  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', bootTimeoutMs: 500, shutdownGraceMs: 80 });
+  t.after(() => rt.shutdown());
+  assert.equal(rt.isReady(), false);
+  const client = new Client({ name: 'observability-test', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await rt.server.connect(serverTransport);
+  await client.connect(clientTransport);
+  await rt.boot();
+  assert.equal(rt.isReady(), true);
+
+  const secret = 'synthetic-secret-ops05';
+  const path = '/home/private/person/file.txt';
+  const records = [];
+  const originalError = console.error;
+  console.error = (line) => records.push(String(line));
+  try {
+    await client.callTool({ name: 'echo', arguments: { secret, path } });
+  } finally { console.error = originalError; }
+
+  const parsed = records.map((line) => JSON.parse(line));
+  assert.equal(parsed.length, 2);
+  const toolEvent = parsed.find((entry) => entry.event === 'tool');
+  assert.ok(toolEvent);
+  assert.deepEqual(Object.keys(toolEvent).sort(), ['cell', 'durationMs', 'event', 'ok', 'tool', 'ts']);
+  assert.equal(toolEvent.ok, true);
+  assert.ok(parsed.some((entry) => entry.event === 'start' && entry.ok));
+  assert.ok(!records.join('\n').includes(secret));
+  assert.ok(!records.join('\n').includes(path));
+  assert.deepEqual(rt.metricsSnapshot()['hela-fixture'], {
+    starts: 1, restarts: 0, failures: 0, toolCalls: 1,
+    totalMs: toolEvent.durationMs, maxMs: toolEvent.durationMs,
+  });
+});
+
+test('readiness stays false when selected cell manifests are unavailable', async (t) => {
+  const box = sandbox();
+  unlinkSync(path.join(box.root, 'config/tool-catalog.json'));
+  const { rt } = await connectRuntime(t, box);
+  assert.equal(rt.isReady(), false);
+  assert.equal(rt.manifestSources.get('hela-fixture'), 'missing');
+});
+
 test('runtime exposes profile context as a prompt and resource without starting cells', { timeout: 10000 }, async (t) => {
   const box = sandbox('normal', ['hela-fixture', 'hela-unused']);
   writeFileSync(path.join(box.root, 'config', 'profiles.json'), JSON.stringify({ profiles: [{
@@ -162,9 +206,12 @@ for (const route of ['plain', 'namespaced', 'pipe', 'agent-alias']) {
     }, 'replacement cell');
     assert.notEqual(fresh.proc.pid, old.proc.pid);
     assert.equal(rt.restartAttempts.get(id), 1);
+    assert.equal(rt.metricsSnapshot()[id].restarts, 1);
+    assert.ok(rt.metricsSnapshot()[id].failures >= 1);
     const after = await client.callTool({ name: `${prefix}echo` });
     assert.equal(JSON.parse(after.content[0].text).pid, fresh.proc.pid);
     assert.equal(events(box).filter((e) => e.event === 'spawn').length, 2);
+    assert.equal(rt.metricsSnapshot()[id].toolCalls, 3);
     t.diagnostic(`${route} PID ${old.proc.pid} -> ${fresh.proc.pid}; timeout result, SIGTERM/SIGKILL, echo succeeded`);
     await rt.shutdown();
     assertGone(fresh.proc.pid);

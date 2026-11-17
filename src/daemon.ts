@@ -42,6 +42,10 @@ export interface RuntimeOptions {
   maxRestartAttempts?: number;
 }
 
+type CellMetrics = { starts: number; restarts: number; failures: number; toolCalls: number; totalMs: number; maxMs: number };
+const safeLabel = (value: string): string => /^[a-zA-Z0-9_.-]{1,100}$/.test(value) ? value : 'unknown';
+const safeError = (error: unknown): string => error instanceof Error ? safeLabel(error.name) : 'Error';
+
 const RUNTIME_UPDATE_CELL = '__runtime__';
 const UPDATE_CHECK_TOOL = 'hela.update.check';
 const UPDATE_APPLY_TOOL = 'hela.update.apply';
@@ -112,6 +116,7 @@ export class HelaRuntime {
   nativeAgent?: NativeNeedleAgent;
   nativeAgentEnabled = process.env.HELA_NATIVE_AGENT !== 'false';
   nativeAgentReady = false;
+  private metrics = new Map<string, CellMetrics>();
 
   constructor(private readonly options: RuntimeOptions = {}) {
     this.root = options.root ?? ecosystemRoot();
@@ -146,7 +151,7 @@ export class HelaRuntime {
     if (!cell?.ready) throw new Error(`Cell not ready: ${tool.cell}`);
     const realName = this.toolToReal.get(tool.name) ?? tool.realName;
     if (!cell.tools.has(realName)) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
-    const response = await callTool(cell, realName, args, this.options.toolTimeoutMs ?? 60000);
+    const response = await this.invokeTool(tool.cell, realName, () => callTool(cell!, realName, args, this.options.toolTimeoutMs ?? 60000));
     return response?.result ?? response?.content ?? response;
   }
 
@@ -277,6 +282,7 @@ export class HelaRuntime {
   }
 
   private async startCell(spec: CellSpec): Promise<void> {
+    this.metric(spec.id).starts++;
     try {
       const started = performance.now();
       const fingerprint = this.manifests.identity(spec).fingerprint;
@@ -291,6 +297,7 @@ export class HelaRuntime {
         return;
       }
       this.cells.set(handle.key, handle);
+      this.logEvent(spec.id, 'start', true);
       this.cellStartupMs.set(spec.id, performance.now() - started);
       this.deadCells.delete(spec.id);
       const cellShort = spec.id.replace(/^hela-/, '');
@@ -299,11 +306,11 @@ export class HelaRuntime {
         this.toolToCell.set(exposed, handle.key);
         this.toolToReal.set(exposed, toolName);
       }
-      console.error(`[hela-runtime] booted ${spec.id} (${handle.tools.size} tools)`);
 
       const onExit = () => {
         if (this.stopping || this.cells.get(spec.id) !== handle) return;
-        console.error(`[hela-runtime] cell ${spec.id} exited (${handle.stopReason ?? 'crash'}), scheduling restart`);
+        this.metric(spec.id).failures++;
+        this.logEvent(spec.id, 'stop', false, undefined, undefined, 'cell exited');
         this.scheduleRestart(spec);
       };
       handle.proc.once('exit', onExit);
@@ -314,8 +321,8 @@ export class HelaRuntime {
       catch { console.error(`[hela-runtime] manifest save failed for ${spec.id}`); }
     } catch (e: unknown) {
       if (this.stopping) return;
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[hela-runtime] FAILED to boot ${spec.id}: ${msg}`);
+      this.metric(spec.id).failures++;
+      this.logEvent(spec.id, 'start', false, undefined, undefined, safeError(e));
       this.scheduleRestart(spec);
     }
   }
@@ -334,6 +341,8 @@ export class HelaRuntime {
       return;
     }
     this.restartAttempts.set(spec.id, attempts + 1);
+    this.metric(spec.id).restarts++;
+    this.logEvent(spec.id, 'restart', true);
     const delay = Math.min((this.options.restartDelayMs ?? 1000) * 2 ** attempts, 8000);
     const timer = setTimeout(() => {
       this.restartTimers.delete(spec.id);
@@ -397,11 +406,25 @@ export class HelaRuntime {
     const httpPort = parseInt(process.env.HELA_HTTP_PORT || '0', 10);
     if (httpPort > 0) {
       const srv = http.createServer((req, res) => {
+        if (req.url === '/livez') {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ status: 'live' }));
+          return;
+        }
+        if (req.url === '/readyz') {
+          const ready = this.isReady();
+          res.statusCode = ready ? 200 : 503;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ status: ready ? 'ready' : 'not_ready' }));
+          return;
+        }
         if (req.url === '/healthz') {
+          const ready = this.isReady();
           const status = {
-            status: 'ok',
+            status: 'ok', liveness: 'live', readiness: ready ? 'ready' : 'not_ready', ready,
             version: VERSION,
             profile: this.profile ?? 'all',
+            counters: this.metricsSnapshot(),
             cells: [...this.specs.keys()].map((id) => {
               const cell = this.cells.get(id);
               return { id, ready: cell?.ready ?? false, tools: cell?.tools.size ?? (this.cachedManifest[id]?.length ?? 0) };
@@ -422,6 +445,37 @@ export class HelaRuntime {
     }
   }
 
+  private metric(cell: string): CellMetrics {
+    let value = this.metrics.get(cell);
+    if (!value) { value = { starts: 0, restarts: 0, failures: 0, toolCalls: 0, totalMs: 0, maxMs: 0 }; this.metrics.set(cell, value); }
+    return value;
+  }
+
+  private metricsSnapshot(): Record<string, CellMetrics> {
+    return Object.fromEntries([...this.metrics].map(([cell, value]) => [cell, { ...value }]));
+  }
+
+  private isReady(): boolean {
+    return this.booted && [...this.specs.keys()].every((id) => this.manifestSources.get(id) !== undefined && this.manifestSources.get(id) !== 'missing');
+  }
+
+  private logEvent(cell: string, event: string, ok: boolean, tool?: string, durationMs?: number, error?: string): void {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), cell: safeLabel(cell), event, ...(tool ? { tool: safeLabel(tool) } : {}), ...(durationMs === undefined ? {} : { durationMs }), ok, ...(error ? { error: safeLabel(error) } : {}) }));
+  }
+
+  private async invokeTool<T>(cell: string, tool: string, invoke: () => Promise<T>): Promise<T> {
+    const started = performance.now();
+    let ok = false;
+    try { const result = await invoke(); ok = true; return result; }
+    catch (error) { this.metric(cell).failures++; throw error; }
+    finally {
+      const durationMs = Math.round(performance.now() - started);
+      const counters = this.metric(cell);
+      counters.toolCalls++; counters.totalMs += durationMs; counters.maxMs = Math.max(counters.maxMs, durationMs);
+      this.logEvent(cell, 'tool', ok, tool, durationMs, ok ? undefined : 'tool invocation failed');
+    }
+  }
+
   async ensureCell(cellKey: string): Promise<CellHandle | undefined> {
     if (this.stopping || this.deadCells.has(cellKey) || !this.specs.has(cellKey)) return undefined;
     const existing = this.cells.get(cellKey);
@@ -435,7 +489,6 @@ export class HelaRuntime {
     if (existing || this.restartTimers.has(cellKey)) return undefined;
     const spec = this.specs.get(cellKey);
     if (!spec) return undefined;
-    console.error(`[hela-runtime] lazy-booting ${cellKey}`);
     await this.bootOne(spec);
     const cell = this.cells.get(cellKey);
     return !this.stopping && cell?.ready ? cell : undefined;
@@ -469,7 +522,7 @@ export class HelaRuntime {
         stepArgs.prev = prev;
       }
       try {
-        const res = await callTool(cell, toolName, stepArgs, this.options.toolTimeoutMs ?? 60000);
+        const res = await this.invokeTool(cellKey, toolName, () => callTool(cell, toolName, stepArgs, this.options.toolTimeoutMs ?? 60000));
         const normalized = res?.result ?? res;
         prev = normalized;
         results.push({ step: i, cell: cellKey, tool: toolName, result: normalized });
@@ -729,21 +782,21 @@ export class HelaRuntime {
       if (this.stopping) return { content: [{ type: 'text', text: 'Runtime is shutting down' }], isError: true };
 
       if (name === UPDATE_CHECK_TOOL || name === UPDATE_APPLY_TOOL) {
-        return this.jsonResult(await this.executeRuntimeUpdate(name, args));
+        return this.jsonResult(await this.invokeTool(RUNTIME_UPDATE_CELL, name, () => this.executeRuntimeUpdate(name, args)));
       }
 
       if (this.nativeAgentEnabled && this.nativeAgentReady && this.nativeAgent) {
         if (name === 'agent_run' || name === 'hela.agent.run') {
-          return this.jsonResult(await this.nativeAgent.run(args));
+          return this.jsonResult(await this.invokeTool(RUNTIME_UPDATE_CELL, name, () => this.nativeAgent!.run(args)));
         }
         if (name === 'hela.agent.plan') {
-          return this.jsonResult(await this.nativeAgent.plan(args));
+          return this.jsonResult(await this.invokeTool(RUNTIME_UPDATE_CELL, name, () => this.nativeAgent!.plan(args)));
         }
         if (name === 'hela.catalog.list') {
-          return this.jsonResult(this.catalogList(args));
+          return this.jsonResult(await this.invokeTool(RUNTIME_UPDATE_CELL, name, async () => this.catalogList(args)));
         }
         if (name === 'hela.catalog.search') {
-          return this.jsonResult(this.catalogSearch(args));
+          return this.jsonResult(await this.invokeTool(RUNTIME_UPDATE_CELL, name, async () => this.catalogSearch(args)));
         }
       }
       if (name === 'hela.pipe') {
@@ -774,7 +827,7 @@ export class HelaRuntime {
         ? this.options.agentTimeoutMs ?? 120000
         : this.options.toolTimeoutMs ?? 60000;
       try {
-        const res = await callTool(cell, targetName, args, timeout);
+        const res = await this.invokeTool(cellKey, targetName, () => callTool(cell!, targetName, args, timeout));
         if (res?.result) return res.result;
         if (res?.content) return res;
         return { content: [{ type: 'text', text: JSON.stringify(res) }] };
@@ -794,6 +847,7 @@ export class HelaRuntime {
   shutdown(): Promise<void> {
     if (this.shutdownTask) return this.shutdownTask;
     this.stopping = true;
+    for (const cell of this.cells.values()) this.logEvent(cell.key, 'stop', true);
     for (const timer of this.restartTimers.values()) clearTimeout(timer);
     this.restartTimers.clear();
     this.bootAbort.abort();

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1 - 2026-11-18
+
+- Add redacted structured lifecycle and tool logs plus per-cell counters to `/healthz`.
+- Separate process liveness from manifest-based readiness with `/livez` and `/readyz`.
+- Keep restart, failure, and tool latency counters in memory for the process lifetime.
+
 ## 1.3.0 - 2026-11-14
 
 - Expose read-only `hela.update.check` and confirmation-gated `hela.update.apply` controls through the runtime and native agent catalog.
