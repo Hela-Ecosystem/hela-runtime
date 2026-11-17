@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.2 - 2026-11-18
+
+- Guard the package-derived runtime version against drift with a test.
+
 ## 1.3.1 - 2026-11-18
 
 - Add redacted structured lifecycle and tool logs plus per-cell counters to `/healthz`.
