@@ -1,3 +1,8 @@
+## [1.3.3] - 2026-11-19
+
+### Changed
+- `npm audit fix` clears two moderate advisories; the fixed-output npm dependency hash moves with the refreshed lockfile.
+
 # Changelog
 
 ## 1.3.2 - 2026-11-18
