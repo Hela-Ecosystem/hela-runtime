@@ -1,3 +1,9 @@
+## [1.3.7] - 2026-11-19
+
+### Changed
+- **Breaking for clients that pin tool names:** namespacing is now on by default, so cells advertise `hela_nucleus_execute_command` instead of `execute_command`. A bare name collides with whatever the host already exposes and a collision is settled by whichever server connected last, which is the tool-shadowing failure class clients cannot see. `HELA_NAMESPACE_TOOLS=0` restores the previous surface; `HELA_NAMESPACE_TOOLS=1` is still accepted and is now the default. The manifest cache key already includes the namespace mode, so a switched client rebuilds its fingerprints once instead of reusing the stale identity.
+- The prompt, resource and pipe paths address cells by their real tool names, so a namespaced call still reaches the same cell tool; a test asserts the cell reports its own name back.
+
 ## [1.3.6] - 2026-11-19
 
 ### Changed

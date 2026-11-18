@@ -56,7 +56,9 @@ function assertGone(pid) {
 }
 
 async function connectRuntime(t, box, overrides = {}) {
-  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', bootTimeoutMs: 500, toolTimeoutMs: 100, agentTimeoutMs: 100, shutdownGraceMs: 80, restartDelayMs: 40, ...overrides });
+  // Namespacing is on by default; these tests are about supervision, not naming, so
+  // they opt out and address tools by their cell-local names.
+  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', namespaced: false, bootTimeoutMs: 500, toolTimeoutMs: 100, agentTimeoutMs: 100, shutdownGraceMs: 80, restartDelayMs: 40, ...overrides });
   t.after(() => rt.shutdown());
   const client = new Client({ name: 'isolated-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -80,6 +82,34 @@ test('aggregated tools expose only the runtime-native agent run entry', { timeou
   assert.deepEqual(agentRunTools.map((tool) => tool.name), ['hela.agent.run']);
 });
 
+test('cell tools are namespaced unless the client opts out', async (t) => {
+  const inherited = process.env.HELA_NAMESPACE_TOOLS;
+  try {
+    delete process.env.HELA_NAMESPACE_TOOLS;
+    const byDefault = await connectRuntime(t, sandbox('normal'), { namespaced: undefined });
+    const names = (await byDefault.client.listTools()).tools.map((tool) => tool.name);
+    assert.ok(names.includes('hela_fixture_echo'), `default should namespace: ${names.join(', ')}`);
+    assert.ok(!names.includes('echo'), 'bare name must not be advertised by default');
+
+    process.env.HELA_NAMESPACE_TOOLS = '0';
+    const optedOut = await connectRuntime(t, sandbox('normal'), { namespaced: undefined });
+    const bare = (await optedOut.client.listTools()).tools.map((tool) => tool.name);
+    assert.ok(bare.includes('echo'), 'HELA_NAMESPACE_TOOLS=0 must expose the cell-local name');
+    assert.ok(!bare.includes('hela_fixture_echo'), 'opt-out must not namespace');
+  } finally {
+    if (inherited === undefined) delete process.env.HELA_NAMESPACE_TOOLS;
+    else process.env.HELA_NAMESPACE_TOOLS = inherited;
+  }
+});
+
+test('a namespaced tool still reaches its cell and reports its real name', async (t) => {
+  const { client } = await connectRuntime(t, sandbox('normal'), { namespaced: undefined });
+  const result = await client.callTool({ name: 'hela_fixture_echo', arguments: { text: 'routed' } });
+  const inner = JSON.parse(result.content[0].text);
+  assert.equal(inner.name, 'echo', 'the namespaced call must reach the cell tool with its real name');
+  assert.equal(typeof inner.pid, 'number');
+});
+
 test('test runner removes inherited environment hooks and credentials', () => {
   assert.deepEqual(Object.keys(process.env)
     .filter((key) => !['NODE_TEST_CONTEXT', 'NODE_TEST_WORKER_ID'].includes(key)).sort(), ['HOME', 'PATH', 'TMPDIR', 'XDG_CACHE_HOME']);
@@ -87,7 +117,7 @@ test('test runner removes inherited environment hooks and credentials', () => {
 
 test('runtime defaults to the minimal profile when no profile is selected', { timeout: 10000 }, async (t) => {
   const box = sandbox();
-  const rt = new HelaRuntime({ ...box, bootTimeoutMs: 500, toolTimeoutMs: 100, shutdownGraceMs: 80 });
+  const rt = new HelaRuntime({ ...box, namespaced: false, bootTimeoutMs: 500, toolTimeoutMs: 100, shutdownGraceMs: 80 });
   t.after(() => rt.shutdown());
   const client = new Client({ name: 'isolated-default-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -101,7 +131,7 @@ test('runtime defaults to the minimal profile when no profile is selected', { ti
 
 test('observability tracks calls, readiness follows manifest loading, and logs redact arguments and paths', { timeout: 10000 }, async (t) => {
   const box = sandbox();
-  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', bootTimeoutMs: 500, shutdownGraceMs: 80 });
+  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', namespaced: false, bootTimeoutMs: 500, shutdownGraceMs: 80 });
   t.after(() => rt.shutdown());
   assert.equal(rt.isReady(), false);
   const client = new Client({ name: 'observability-test', version: '1.0.0' });
@@ -512,7 +542,7 @@ test('digest mismatch warns with the cell name and recovers its tools once at st
   const box = sandbox();
   const cellFile = path.join(box.root, box.specs[0].dir, box.specs[0].entry);
   writeFileSync(cellFile, readFileSync(cellFile, 'utf8') + '\nvoid 0;\n');
-  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', bootTimeoutMs: 1000, shutdownGraceMs: 80 });
+  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', namespaced: false, bootTimeoutMs: 1000, shutdownGraceMs: 80 });
   t.after(() => rt.shutdown());
   const client = new Client({ name: 'digest-mismatch-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

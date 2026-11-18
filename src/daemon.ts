@@ -154,7 +154,10 @@ export class HelaRuntime {
   constructor(private readonly options: RuntimeOptions = {}) {
     this.root = options.root ?? ecosystemRoot();
     this.profile = options.profile === undefined ? process.env.HELA_PROFILE || 'minimal' : options.profile;
-    this.namespaced = options.namespaced ?? process.env.HELA_NAMESPACE_TOOLS === '1';
+    // Namespacing is on by default: bare names like read_file or execute_command
+    // shadow whatever the host already exposes, and a collision is resolved by
+    // whichever server connected last. HELA_NAMESPACE_TOOLS=0 opts a client back out.
+    this.namespaced = options.namespaced ?? process.env.HELA_NAMESPACE_TOOLS !== '0';
     this.server = this.createServer();
   }
 
