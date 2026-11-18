@@ -112,12 +112,12 @@ export class ManifestStore {
     return { digest, features, revision, fingerprint: hash([spec, digest, features, revision, environment]) };
   }
 
-  load(spec: CellSpec): { tools: ToolDefinition[]; source: 'cache' | 'catalog' | 'missing'; fingerprint: string } {
+  load(spec: CellSpec): { tools: ToolDefinition[]; source: 'cache' | 'catalog' | 'missing'; fingerprint: string; reason: string } {
     const identity = this.identity(spec);
     const cached = this.read().profiles[this.key]?.[spec.id];
     if (cached?.fingerprint === identity.fingerprint && validTools(cached.tools)) {
       this.cells[spec.id] = cached;
-      return { tools: cached.tools, source: 'cache', fingerprint: identity.fingerprint };
+      return { tools: cached.tools, source: 'cache', fingerprint: identity.fingerprint, reason: 'cache fingerprint matched' };
     }
     try {
       const catalog = JSON.parse(fs.readFileSync(path.join(this.root, 'config/tool-catalog.json'), 'utf8'));
@@ -126,10 +126,14 @@ export class ManifestStore {
       if (entry && entry.revision === spec.revision && entry.version === spec.version && Array.isArray(digests) && digests.includes(identity.digest)
           && (!identity.revision || identity.revision === spec.revision)) {
         const variant = entry.variants.find((candidate: { features: unknown }) => hash(candidate.features) === hash(identity.features));
-        if (variant && validTools(variant.tools)) return { tools: variant.tools, source: 'catalog', fingerprint: identity.fingerprint };
+        if (variant && validTools(variant.tools)) return { tools: variant.tools, source: 'catalog', fingerprint: identity.fingerprint, reason: 'catalog build digest and feature variant matched' };
       }
+      const reason = !entry ? 'catalog entry missing' : !digests.includes(identity.digest)
+        ? `catalog build digest mismatch (expected ${digests.filter(Boolean).join(', ') || 'none'}, actual ${identity.digest})`
+        : 'catalog revision, version, or feature variant mismatch';
+      return { tools: [], source: 'missing', fingerprint: identity.fingerprint, reason };
     } catch { /* Explicit pipe routing can discover an uncatalogued cell on demand. */ }
-    return { tools: [], source: 'missing', fingerprint: identity.fingerprint };
+    return { tools: [], source: 'missing', fingerprint: identity.fingerprint, reason: 'catalog unavailable or invalid' };
   }
 
   save(id: string, fingerprint: string, tools: ToolDefinition[]): void {

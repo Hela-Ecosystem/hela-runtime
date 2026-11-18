@@ -125,12 +125,14 @@ test('observability tracks calls, readiness follows manifest loading, and logs r
   });
 });
 
-test('readiness stays false when selected cell manifests are unavailable', async (t) => {
+test('missing manifests are recovered by one live probe and expose the learned tools', async (t) => {
   const box = sandbox();
   unlinkSync(path.join(box.root, 'config/tool-catalog.json'));
-  const { rt } = await connectRuntime(t, box);
-  assert.equal(rt.isReady(), false);
-  assert.equal(rt.manifestSources.get('hela-fixture'), 'missing');
+  const { rt, client } = await connectRuntime(t, box);
+  assert.equal(rt.isReady(), true);
+  assert.equal(rt.manifestSources.get('hela-fixture'), 'live');
+  assert.equal(events(box).filter(event => event.event === 'spawn').length, 1);
+  assert.ok((await client.listTools()).tools.some(tool => tool.name === 'echo'));
 });
 
 test('runtime exposes profile context as a prompt and resource without starting cells', { timeout: 10000 }, async (t) => {
@@ -433,14 +435,15 @@ for (const change of ['revision', 'version', 'build', 'environment', 'features']
     writeFileSync(inventoryFile, JSON.stringify(inventory));
     const second = await connectRuntime(t, box);
     assert.notEqual(second.rt.manifestSources.get(spec.id), 'cache');
-    assert.equal(second.rt.cells.size, 0);
     if (change !== 'environment') {
       const tools = (await second.client.listTools()).tools;
-      assert.deepEqual(tools.map(tool => tool.name), ['hela.update.check', 'hela.update.apply', 'hela.pipe']);
-      await assert.rejects(second.client.callTool({ name: 'echo' }), /Unknown tool/);
-      assert.equal(events(box).filter(event => event.event === 'spawn').length, 1);
+      assert.ok(tools.some(tool => tool.name === 'echo'));
+      assert.equal(second.rt.manifestSources.get(spec.id), 'live');
+      assert.equal(events(box).filter(event => event.event === 'spawn').length, 2);
+      assert.equal((await second.client.callTool({ name: 'echo' })).isError, undefined);
     } else {
       assert.equal(second.rt.manifestSources.get(spec.id), 'catalog');
+      assert.equal(second.rt.cells.size, 0);
       await second.client.callTool({ name: 'echo' });
       assert.ok(!readFileSync(box.manifestPath, 'utf8').includes('synthetic-value-must-not-be-persisted'));
     }
@@ -480,19 +483,39 @@ for (const content of ['{"hela-fixture":[{"name":"obsolete"}]}', '{broken', '{"f
   });
 }
 
-test('missing catalog is explicit and pipe can discover only its named cell on demand', async (t) => {
+test('missing catalog recovers each selected cell and pipe can use its learned tools', async (t) => {
   const box = sandbox('normal', ['hela-fixture', 'hela-unused']);
   unlinkSync(path.join(box.root, 'config/tool-catalog.json'));
   const { rt, client } = await connectRuntime(t, box);
-  assert.equal(rt.manifestSources.get('hela-fixture'), 'missing');
-  assert.deepEqual((await client.listTools()).tools.map(tool => tool.name), ['hela.update.check', 'hela.update.apply', 'hela.pipe']);
-  await assert.rejects(client.callTool({ name: 'echo' }), /Unknown tool/);
-  assert.equal(rt.cells.size, 0);
+  assert.equal(rt.manifestSources.get('hela-fixture'), 'live');
+  assert.ok((await client.listTools()).tools.some(tool => tool.name === 'echo'));
+  assert.equal(rt.cells.size, 2);
+  assert.equal(events(box, 'hela-unused').filter(event => event.event === 'spawn').length, 1);
   const response = await client.callTool({ name: 'hela.pipe', arguments: { steps: [{ cell: 'hela-fixture', tool: 'echo' }] } });
   assert.equal(response.isError, undefined);
-  assert.deepEqual([...rt.cells.keys()], ['hela-fixture']);
-  assert.deepEqual(events(box, 'hela-unused'), []);
+  assert.deepEqual([...rt.cells.keys()].sort(), ['hela-fixture', 'hela-unused']);
   assert.ok((await client.listTools()).tools.some(tool => tool.name === 'echo'));
+});
+
+test('digest mismatch warns with the cell name and recovers its tools once at startup', { timeout: 10000 }, async (t) => {
+  const box = sandbox();
+  const cellFile = path.join(box.root, box.specs[0].dir, box.specs[0].entry);
+  writeFileSync(cellFile, readFileSync(cellFile, 'utf8') + '\nvoid 0;\n');
+  const rt = new HelaRuntime({ ...box, profile: 'dev-workspace', bootTimeoutMs: 1000, shutdownGraceMs: 80 });
+  t.after(() => rt.shutdown());
+  const client = new Client({ name: 'digest-mismatch-test', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await rt.server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const logs = [];
+  const originalError = console.error;
+  console.error = line => logs.push(String(line));
+  try { await rt.boot(); } finally { console.error = originalError; }
+  assert.equal(rt.manifestSources.get('hela-fixture'), 'live');
+  assert.equal(events(box).filter(event => event.event === 'spawn').length, 1);
+  assert.ok((await client.listTools()).tools.some(tool => tool.name === 'echo'));
+  assert.ok(logs.some(line => line.includes('manifest cell=hela-fixture source=missing') && line.includes('digest mismatch')));
+  assert.ok(logs.some(line => line.includes('regenerate: cd ') && line.includes('npm run catalog:generate -- --profile dev-workspace')));
 });
 
 test('runtime exposes update controls without exposing arbitrary installer commands', async (t) => {

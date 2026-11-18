@@ -111,7 +111,7 @@ export class HelaRuntime {
   private bootAbort = new AbortController();
   private healthServer?: http.Server;
   private manifests!: ManifestStore;
-  manifestSources = new Map<string, 'cache' | 'catalog' | 'missing'>();
+  manifestSources = new Map<string, 'cache' | 'catalog' | 'missing' | 'live'>();
   cellStartupMs = new Map<string, number>();
   nativeAgent?: NativeNeedleAgent;
   nativeAgentEnabled = process.env.HELA_NATIVE_AGENT !== 'false';
@@ -317,6 +317,7 @@ export class HelaRuntime {
       if (handle.proc.exitCode !== null || handle.proc.signalCode !== null) onExit();
 
       this.cachedManifest[spec.id] = [...handle.tools.values()];
+      this.manifestSources.set(spec.id, 'live');
       try { this.manifests.save(spec.id, fingerprint, [...handle.tools.values()]); }
       catch { console.error(`[hela-runtime] manifest save failed for ${spec.id}`); }
     } catch (e: unknown) {
@@ -362,10 +363,13 @@ export class HelaRuntime {
     const specs = this.selectedSpecs();
     this.manifests = new ManifestStore(this.options.manifestPath ?? manifestPath(), this.root, this.profile, this.namespaced);
     this.cachedManifest = {};
+    const recoverySpecs: CellSpec[] = [];
+    const reasons = new Map<string, string>();
     for (const spec of specs) {
       try {
         const manifest = this.manifests.load(spec);
         this.manifestSources.set(spec.id, manifest.source);
+        reasons.set(spec.id, manifest.reason);
         this.cachedManifest[spec.id] = manifest.tools;
         const cellShort = spec.id.replace(/^hela-/, '');
         for (const tool of manifest.tools) {
@@ -374,12 +378,21 @@ export class HelaRuntime {
           this.toolToCell.set(exposed, spec.id);
           this.toolToReal.set(exposed, tool.name);
         }
+        if (manifest.source === 'missing') recoverySpecs.push(spec);
       } catch (error) {
         if (error instanceof Error && error.message.startsWith('Duplicate tool:')) throw error;
         this.manifestSources.set(spec.id, 'missing');
+        reasons.set(spec.id, error instanceof Error ? error.message : 'manifest load failed');
+        recoverySpecs.push(spec);
       }
     }
     console.error(`[hela-runtime] profile=${this.profile ?? 'all'} cells=${specs.length} mode=on-demand`);
+    const profileArg = this.profile ?? 'all';
+    const regenerate = `cd ${this.root} && npm run catalog:generate -- --profile ${profileArg}`;
+    for (const spec of specs) {
+      const source = this.manifestSources.get(spec.id) ?? 'missing';
+      console.error(`[hela-runtime] manifest cell=${spec.id} source=${source} reason=${reasons.get(spec.id) ?? 'manifest load failed'}; regenerate: ${regenerate}`);
+    }
 
     if (this.nativeAgentEnabled) {
       this.nativeAgent = new NativeNeedleAgent(this, {
@@ -402,6 +415,10 @@ export class HelaRuntime {
     this.attachHandlers(this.server);
     this.booted = true;
 
+    // A stale/missing generated schema cannot safely advertise the cell. Probe
+    // only those cells once, then replace the missing manifest with live tools.
+    for (const spec of recoverySpecs) await this.bootOne(spec);
+
     // optional HTTP health endpoint
     const httpPort = parseInt(process.env.HELA_HTTP_PORT || '0', 10);
     if (httpPort > 0) {
@@ -415,7 +432,7 @@ export class HelaRuntime {
           const ready = this.isReady();
           res.statusCode = ready ? 200 : 503;
           res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ status: ready ? 'ready' : 'not_ready' }));
+          res.end(JSON.stringify({ status: ready ? 'ready' : 'not_ready', manifestSources: Object.fromEntries(this.manifestSources) }));
           return;
         }
         if (req.url === '/healthz') {
@@ -427,7 +444,7 @@ export class HelaRuntime {
             counters: this.metricsSnapshot(),
             cells: [...this.specs.keys()].map((id) => {
               const cell = this.cells.get(id);
-              return { id, ready: cell?.ready ?? false, tools: cell?.tools.size ?? (this.cachedManifest[id]?.length ?? 0) };
+              return { id, ready: cell?.ready ?? false, tools: cell?.tools.size ?? (this.cachedManifest[id]?.length ?? 0), manifestSource: this.manifestSources.get(id) ?? 'missing' };
             }),
           };
           res.setHeader('Content-Type', 'application/json');

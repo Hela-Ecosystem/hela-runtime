@@ -188,6 +188,17 @@ node scripts/test-runtime-parity.mjs  # parity + crash-recovery harness
 npm run test:profiles                 # all eight profiles, namespacing off/on, cold/warm timings
 ```
 
+### Release steps
+
+After changing dependencies or updating `package-lock.json`, refresh the fixed-output Nix hash before building release artifacts:
+
+```bash
+npm run nix:refresh-hash
+npm test
+```
+
+The helper obtains the expected hash from Nix's mismatch error, writes it to `flake.nix`, and runs `nix build .` again to verify it. If Nix is unavailable, it exits successfully without changing the file.
+
 Ecosystem doctor, integration, and version probes use temporary homes/project memory with vault hooks and credentials excluded. They require real MCP replies; merely staying alive is not a successful handshake. Optional hardware capability still requires separate device/Blender integration tests.
 
 ---

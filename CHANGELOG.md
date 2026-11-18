@@ -1,9 +1,22 @@
+## [1.3.4] - 2026-11-19
+
+### Fixed
+- A cell rebuilt on a different host hashes differently, so its catalog manifest no longer matched and the runtime silently dropped that cell from the tool surface (on servy: 209 instead of 240 tools, and calls answered "Unknown tool"). Missing or mismatched cells are now named on startup with the regeneration command, probed once so their real tools are advertised, and reported per cell in `/readyz`.
+
+### Added
+- `npm run nix:hash` refreshes the flake's fixed-output npm dependency hash by probing the mismatch, writing the value and rebuilding; it leaves the file untouched when Nix is unavailable.
+
 ## [1.3.3] - 2026-11-19
 
 ### Changed
 - `npm audit fix` clears two moderate advisories; the fixed-output npm dependency hash moves with the refreshed lockfile.
 
 # Changelog
+
+## 1.3.4 - 2026-11-19
+
+- Recover missing or digest-mismatched cell manifests by probing only those cells at startup; report manifest source and regeneration guidance.
+- Add `npm run nix:refresh-hash` to refresh and verify the fixed-output Nix dependency hash after lockfile changes.
 
 ## 1.3.2 - 2026-11-18
 
