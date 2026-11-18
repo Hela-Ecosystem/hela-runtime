@@ -1,3 +1,12 @@
+## [1.3.6] - 2026-11-19
+
+### Changed
+- The cell RPC boundary is typed instead of `any`: `request` resolves a `JsonRpcEnvelope`, `callTool` resolves a validated MCP tool result, and a payload that is not one (or a JSON-RPC error answer) raises a named `CellProtocolError` naming the offending keys rather than flowing on as `undefined`. A cell that answers `tools/call` with a JSON-RPC error now surfaces as a tool error instead of a success-shaped blob containing the error.
+- Cell directory resolution no longer guesses from `process.cwd()`. Only the caller's root and its parent are searched (installed layouts keep cells under the installation dir, a dev checkout keeps them beside the runtime), and when neither exists `CellDirectoryError` names the root and every path tried instead of returning a path that later fails as a spawn `ENOENT`.
+
+### Fixed
+- A corrupted response no longer costs the caller a full timeout. A line that is not JSON stays ignored, as a cell logging to stdout is normal; a line that fails to parse yet carries `jsonrpc`, or parses onto a pending id without being a JSON-RPC response, is counted on the handle, logged once with a truncated sample, and rejects the pending request immediately.
+
 ## [1.3.5] - 2026-11-19
 
 ### Fixed

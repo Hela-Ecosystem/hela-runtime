@@ -320,8 +320,9 @@ for (const mode of ['boot-hang', 'boot-fail', 'crash-loop']) {
   });
 }
 
-test('spawn failure rejects without leaving a boot or shutdown timer hanging', { timeout: 3000 }, async () => {
-  await assert.rejects(bootCell({ id: 'missing', alias: 'missing', source: 'fixture', dir: 'missing', entry: 'missing.mjs' }, { root: path.join(os.tmpdir(), 'nonexistent-fixture-root'), timeoutMs: 1000 }), /ENOENT/);
+test('a cell that cannot start rejects without leaving a boot or shutdown timer hanging', { timeout: 3000 }, async () => {
+  const box = sandbox();
+  await assert.rejects(bootCell({ ...box.specs[0], entry: 'missing.mjs' }, { root: box.root, timeoutMs: 1000 }), /exited/);
 });
 
 for (const namespaced of [false, true]) {

@@ -9,6 +9,7 @@ import {
   ReadResourceRequestSchema,
   McpError,
   ErrorCode,
+  type CallToolResult,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import fs from 'node:fs';
@@ -185,8 +186,7 @@ export class HelaRuntime {
     if (!cell?.ready) throw new Error(`Cell not ready: ${tool.cell}`);
     const realName = this.toolToReal.get(tool.name) ?? tool.realName;
     if (!cell.tools.has(realName)) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
-    const response = await this.invokeTool(tool.cell, realName, () => callTool(cell!, realName, args, this.options.toolTimeoutMs ?? 60000));
-    return response?.result ?? response?.content ?? response;
+    return this.invokeTool(tool.cell, realName, () => callTool(cell!, realName, args, this.options.toolTimeoutMs ?? 60000));
   }
 
   private updateControllerPath(): string {
@@ -574,9 +574,8 @@ export class HelaRuntime {
       }
       try {
         const res = await this.invokeTool(cellKey, toolName, () => callTool(cell, toolName, stepArgs, this.options.toolTimeoutMs ?? 60000));
-        const normalized = res?.result ?? res;
-        prev = normalized;
-        results.push({ step: i, cell: cellKey, tool: toolName, result: normalized });
+        prev = res;
+        results.push({ step: i, cell: cellKey, tool: toolName, result: res });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return { content: [{ type: 'text', text: `Pipe failed at step ${i} (${cellKey}/${toolName}): ${msg}` }], isError: true };
@@ -879,10 +878,7 @@ export class HelaRuntime {
         ? this.options.agentTimeoutMs ?? 120000
         : this.options.toolTimeoutMs ?? 60000;
       try {
-        const res = await this.invokeTool(cellKey, targetName, () => callTool(cell!, targetName, args, timeout));
-        if (res?.result) return res.result;
-        if (res?.content) return res;
-        return { content: [{ type: 'text', text: JSON.stringify(res) }] };
+        return await this.invokeTool(cellKey, targetName, () => callTool(cell!, targetName, args, timeout)) as CallToolResult;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return { content: [{ type: 'text', text: `Error: ${msg}` }], isError: true };
