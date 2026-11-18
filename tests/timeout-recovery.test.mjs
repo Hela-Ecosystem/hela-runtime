@@ -70,6 +70,16 @@ async function runtime(t, mode = 'normal', overrides = {}, ids) {
   return connectRuntime(t, sandbox(mode, ids), overrides);
 }
 
+test('aggregated tools expose only the runtime-native agent run entry', { timeout: 10000 }, async (t) => {
+  const { rt, client } = await runtime(t, 'normal', {}, ['hela-mitosis']);
+  rt.nativeAgentReady = true;
+  rt.nativeAgent = {};
+
+  const agentRunTools = (await client.listTools()).tools
+    .filter((tool) => tool.name === 'agent_run' || tool.name === 'hela.agent.run');
+  assert.deepEqual(agentRunTools.map((tool) => tool.name), ['hela.agent.run']);
+});
+
 test('test runner removes inherited environment hooks and credentials', () => {
   assert.deepEqual(Object.keys(process.env)
     .filter((key) => !['NODE_TEST_CONTEXT', 'NODE_TEST_WORKER_ID'].includes(key)).sort(), ['HOME', 'PATH', 'TMPDIR', 'XDG_CACHE_HOME']);

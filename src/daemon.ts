@@ -50,6 +50,38 @@ const RUNTIME_UPDATE_CELL = '__runtime__';
 const UPDATE_CHECK_TOOL = 'hela.update.check';
 const UPDATE_APPLY_TOOL = 'hela.update.apply';
 
+// Mitosis's agent_run is cell-local; the aggregate surface exposes the runtime agent as hela.agent.run.
+const excludedAgentCatalogToolNames = new Set([
+  'agent_run',
+  'hela.agent.run',
+  'hela.agent.plan',
+  'hela.catalog.list',
+  'hela.catalog.search',
+  'hela.pipe',
+  'workflow_orchestrator',
+  'workflow_status',
+  'workflow_cancel',
+  'validate_tool_chain',
+  'analyze_tool_chain_performance',
+  'analyze_tools',
+  'generate_route_suggestions',
+  'get_tool_chain_analysis',
+  'suggest_skill_chain',
+  'brainstorming',
+  'sequentialthinking',
+  'list_mcp_servers',
+  'search_instructions',
+  'load_instruction',
+  'get_prompt',
+  'search_prompts',
+  'get_resource_set',
+  'search_resource_sets',
+]);
+const excludedAgentCatalogToolPatterns = [
+  /^llm_.*$/,
+  /^agent_(spawn|send|fork|list|info|close|create)$/,
+];
+
 const runtimeUpdateTools: AgentTool[] = [
   {
     name: UPDATE_CHECK_TOOL,
@@ -127,7 +159,6 @@ export class HelaRuntime {
 
   /** Build the complete, live tool catalog across every selected cell. */
   agentCatalog(): AgentTool[] {
-    const excluded = /^(agent_run|hela\.agent\.run|hela\.agent\.plan|hela\.catalog\.list|hela\.catalog\.search|hela\.pipe|workflow_orchestrator|workflow_status|workflow_cancel|validate_tool_chain|analyze_tool_chain_performance|analyze_tools|generate_route_suggestions|get_tool_chain_analysis|suggest_skill_chain|llm_.*|brainstorming|sequentialthinking|list_mcp_servers|search_instructions|load_instruction|get_prompt|search_prompts|get_resource_set|search_resource_sets|agent_(spawn|send|fork|list|info|close|create))$/;
     const seen = new Set<string>();
     const catalog: AgentTool[] = [...runtimeUpdateTools];
     for (const [cellKey, cached] of Object.entries(this.cachedManifest)) {
@@ -136,7 +167,10 @@ export class HelaRuntime {
       const short = cellKey.replace(/^hela-/, '');
       for (const tool of live) {
         const exposed = this.namespaced ? `hela_${short}_${tool.name}` : tool.name;
-        if (seen.has(exposed) || excluded.test(exposed) || excluded.test(tool.name)) continue;
+        if (seen.has(exposed)
+          || excludedAgentCatalogToolNames.has(exposed)
+          || excludedAgentCatalogToolNames.has(tool.name)
+          || excludedAgentCatalogToolPatterns.some((pattern) => pattern.test(exposed) || pattern.test(tool.name))) continue;
         seen.add(exposed);
         catalog.push({ name: exposed, cell: cellKey, realName: tool.name, description: tool.description, inputSchema: tool.inputSchema });
       }
@@ -666,6 +700,8 @@ export class HelaRuntime {
         if (this.deadCells.has(cell.key)) continue;
         const cellShort = cell.key.replace(/^hela-/, '');
         for (const t of cell.tools.values()) {
+          // Hide Mitosis's cell-local agent; the runtime-native tool is added below.
+          if (cell.key === 'hela-mitosis' && t.name === 'agent_run') continue;
           const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
           if (seen.has(exposed)) continue;
           seen.add(exposed);
@@ -680,6 +716,8 @@ export class HelaRuntime {
         if (this.deadCells.has(cellKey)) continue;
         const cellShort = cellKey.replace(/^hela-/, '');
         for (const t of cachedTools) {
+          // Hide Mitosis's cell-local agent; the runtime-native tool is added below.
+          if (cellKey === 'hela-mitosis' && t.name === 'agent_run') continue;
           const exposed = this.namespaced ? `hela_${cellShort}_${t.name}` : t.name;
           if (seen.has(exposed)) continue;
           seen.add(exposed);
@@ -703,9 +741,6 @@ export class HelaRuntime {
           required: ['task'],
         };
         const description = 'Runtime-native Needle agent: retrieves relevant tools from the full aggregated catalog, plans with the bundled Needle 3 model, repairs arguments against each JSON Schema, and executes cell tools in-process. No OpenRouter key required. This supersedes the cell-local Mitosis agent_run.';
-        const existing = tools.find((tool) => tool.name === 'agent_run');
-        if (existing) Object.assign(existing, { description, inputSchema: agentInputSchema });
-        else tools.push({ name: 'agent_run', description, inputSchema: agentInputSchema });
         if (!tools.find((tool) => tool.name === 'hela.agent.run')) {
           tools.push({ name: 'hela.agent.run', description, inputSchema: agentInputSchema });
         }

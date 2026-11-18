@@ -1,3 +1,8 @@
+## [1.3.5] - 2026-11-19
+
+### Fixed
+- Exclude Mitosis's cell-local `agent_run` from the aggregated tool surface and expose only the runtime-native `hela.agent.run` entry.
+
 ## [1.3.4] - 2026-11-19
 
 ### Fixed
