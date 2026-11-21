@@ -21,13 +21,21 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     }
     send(request.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'isolated-fixture', version: '1.0.0' } });
   } else if (request.method === 'tools/list') {
-    send(request.id, { tools: ['echo', 'hang', 'hold', 'crash', 'agent_run'].map((name) => ({ name, inputSchema: { type: 'object' } })) });
+    send(request.id, { tools: ['echo', 'hang', 'hold', 'crash', 'agent_run', 'fail', 'summarize'].map((name) => ({ name, inputSchema: { type: 'object' } })) });
     if (mode === 'crash-loop') setTimeout(() => process.exit(17), 30);
   } else if (request.method === 'tools/call') {
     const { name, arguments: args } = request.params;
     log(name);
     if (name === 'hang' || name === 'hold' || args?.hang) return;
     if (name === 'crash') process.exit(17);
+    if (name === 'fail') {
+      send(request.id, { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'boom' }) }] });
+      return;
+    }
+    if (name === 'summarize') {
+      send(request.id, { content: [{ type: 'text', text: JSON.stringify({ success: true, got: args?.text ?? null, prev: args?.prev ?? null }) }] });
+      return;
+    }
     send(request.id, { content: [{ type: 'text', text: JSON.stringify({ pid: process.pid, name }) }] });
   }
 });

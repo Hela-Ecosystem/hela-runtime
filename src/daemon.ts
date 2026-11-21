@@ -548,10 +548,43 @@ export class HelaRuntime {
     return !this.stopping && cell?.ready ? cell : undefined;
   }
 
+  /**
+   * Interpret a cell's tool result. Cells report failure inside the payload
+   * (`{success:false}` / `{ok:false}`) rather than through the transport, so the
+   * pipe has to read the body to know a step failed (hela-runtime#3).
+   */
+  private pipeStepOutcome(res: unknown): { ok: boolean; payload: unknown; error?: string } {
+    const envelope = res as { content?: Array<{ type?: string; text?: string }>; isError?: boolean } | undefined;
+    const text = (envelope?.content ?? [])
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text as string)
+      .join('\n');
+
+    let structured: unknown;
+    try {
+      structured = JSON.parse(text);
+    } catch {
+      structured = undefined;
+    }
+
+    const failed = envelope?.isError === true
+      || (structured !== null && typeof structured === 'object'
+        && ((structured as Record<string, unknown>).success === false || (structured as Record<string, unknown>).ok === false));
+    if (!failed) return { ok: true, payload: structured !== undefined ? structured : text };
+
+    const record = (structured ?? {}) as Record<string, unknown>;
+    const reason = record.error ?? record.message ?? text.slice(0, 300) ?? 'step failed';
+    return { ok: false, payload: structured !== undefined ? structured : text, error: String(reason) };
+  }
+
   private async runPipe(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const steps = Array.isArray(args?.steps) ? args.steps : [];
+    const onError = args?.onError === 'continue' ? 'continue' : 'stop';
     const results: Record<string, unknown>[] = [];
     let prev: unknown = null;
+    let failedStep: number | null = null;
+    let firstError: string | undefined;
+
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i] as any;
       const cellKey = step.cell;
@@ -566,25 +599,61 @@ export class HelaRuntime {
       if (!cell || !cell.ready) {
         return { content: [{ type: 'text', text: `Pipe failed at step ${i}: cell ${cellKey} not ready` }], isError: true };
       }
+
       let stepArgs = step.args ? { ...step.args } : {};
       for (const k of Object.keys(stepArgs)) {
-        if (typeof stepArgs[k] === 'string') {
-          stepArgs[k] = (stepArgs[k] as string).replace(/\{\{prev\}\}/g, typeof prev === 'string' ? prev : JSON.stringify(prev));
+        if (typeof stepArgs[k] !== 'string') continue;
+        const raw = stepArgs[k] as string;
+        if (raw.includes('{{prev}}')) {
+          // Never hand a failed step's error text to the next tool as input. With
+          // onError=continue it becomes null so the next step fails loudly instead
+          // of analysing an error string.
+          if (prev === null) stepArgs[k] = raw === '{{prev}}' ? null : raw.replace(/\{\{prev\}\}/g, '');
+          else stepArgs[k] = raw.replace(/\{\{prev\}\}/g, typeof prev === 'string' ? prev : JSON.stringify(prev));
         }
       }
       if (prev !== null && stepArgs.prev === undefined && stepArgs.input === undefined) {
         stepArgs.prev = prev;
       }
+
       try {
         const res = await this.invokeTool(cellKey, toolName, () => callTool(cell, toolName, stepArgs, this.options.toolTimeoutMs ?? 60000));
-        prev = res;
-        results.push({ step: i, cell: cellKey, tool: toolName, result: res });
+        const outcome = this.pipeStepOutcome(res);
+        results.push({
+          step: i,
+          cell: cellKey,
+          tool: toolName,
+          ok: outcome.ok,
+          ...(outcome.ok ? {} : { error: outcome.error }),
+          result: res,
+        });
+        if (!outcome.ok) {
+          if (failedStep === null) { failedStep = i; firstError = outcome.error; }
+          if (onError === 'stop') break;
+          prev = null;
+        } else {
+          prev = outcome.payload;
+        }
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return { content: [{ type: 'text', text: `Pipe failed at step ${i} (${cellKey}/${toolName}): ${msg}` }], isError: true };
+        const message = e instanceof Error ? e.message : String(e);
+        results.push({ step: i, cell: cellKey, tool: toolName, ok: false, error: message });
+        if (failedStep === null) { failedStep = i; firstError = message; }
+        if (onError === 'stop') break;
+        prev = null;
       }
     }
-    return { content: [{ type: 'text', text: JSON.stringify({ ok: true, steps: results.length, results }, null, 2) }] };
+
+    const ok = failedStep === null;
+    const payload = {
+      ok,
+      steps: results.length,
+      ...(failedStep !== null ? { failedStep, error: firstError } : {}),
+      results,
+    };
+    return {
+      content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+      ...(ok ? {} : { isError: true }),
+    };
   }
 
   private jsonResult(value: unknown): { content: Array<{ type: string; text: string }>; isError?: boolean } {
@@ -806,7 +875,7 @@ export class HelaRuntime {
       if (!tools.find((t) => t.name === 'hela.pipe')) {
         tools.push({
           name: 'hela.pipe',
-          description: 'Run a sequence of tool calls across cells in-process, piping each result to the next. Steps: [{cell, tool, args}]. Use "{{prev}}" in string args to inject previous result.',
+          description: 'Run a sequence of tool calls across cells in-process, piping each result to the next. Steps: [{cell, tool, args}]. Use "{{prev}}" in string args to inject the previous result. Fails closed: onError defaults to "stop", ok is false when any step failed, and a failed step is never piped onward as data.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -822,6 +891,12 @@ export class HelaRuntime {
                   required: ['cell', 'tool'],
                 },
               },
+            },
+            onError: {
+              type: 'string',
+              enum: ['stop', 'continue'],
+              description: 'What to do when a step fails. Default "stop"; "continue" runs the remaining steps with {{prev}} unset.',
+              default: 'stop',
             },
             required: ['steps'],
           },

@@ -1,3 +1,12 @@
+## [1.4.0] - 2026-11-22
+
+### Changed
+- **Breaking default for `hela.pipe`:** a failing step now makes the pipe fail. `ok` reflects every step (plus `failedStep`), `onError` defaults to `stop`, and each result carries its own `ok`. Previously the top-level verdict said `ok: true` while a middle step had failed (hela-runtime#3).
+
+### Fixed
+- A failed step is no longer piped onward as data. `{{prev}}` used to receive the previous step's result even when that step failed, so a downstream tool produced a confident answer computed from an error string. On failure with `onError: "continue"` the next step now sees no previous value, so it fails loudly instead.
+- Cell failures are detected from the payload (`success: false` / `ok: false`) as well as the transport, because cells report failure inside a text content block rather than as an MCP protocol error.
+
 ## [1.3.7] - 2026-11-19
 
 ### Changed
