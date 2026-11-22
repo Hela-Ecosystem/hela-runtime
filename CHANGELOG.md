@@ -1,3 +1,8 @@
+## [1.4.1] - 2026-11-22
+
+### Added
+- `hela.pipe` reports the ecosystem response contract: a top-level `status` of `ok` / `degraded` / `failed`, a per-step `status`, and a `degraded` array naming the step and the reasons. A step whose payload marks `degraded`, `partial`, `truncated`, `status: "degraded"` or `warnings` makes the pipe `degraded` while `ok` stays true and `isError` stays unset. Documented in `docs/response-contract.md` (hela-mcp-ecosystem#8).
+
 ## [1.4.0] - 2026-11-22
 
 ### Changed

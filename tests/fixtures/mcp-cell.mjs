@@ -21,7 +21,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     }
     send(request.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'isolated-fixture', version: '1.0.0' } });
   } else if (request.method === 'tools/list') {
-    send(request.id, { tools: ['echo', 'hang', 'hold', 'crash', 'agent_run', 'fail', 'summarize'].map((name) => ({ name, inputSchema: { type: 'object' } })) });
+    send(request.id, { tools: ['echo', 'hang', 'hold', 'crash', 'agent_run', 'fail', 'summarize', 'degrade', 'truncate'].map((name) => ({ name, inputSchema: { type: 'object' } })) });
     if (mode === 'crash-loop') setTimeout(() => process.exit(17), 30);
   } else if (request.method === 'tools/call') {
     const { name, arguments: args } = request.params;
@@ -30,6 +30,14 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     if (name === 'crash') process.exit(17);
     if (name === 'fail') {
       send(request.id, { content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'boom' }) }] });
+      return;
+    }
+    if (name === 'degrade') {
+      send(request.id, { content: [{ type: 'text', text: JSON.stringify({ ok: true, rows: 3, degraded: { reason: 'two rows dropped: no id field' } }) }] });
+      return;
+    }
+    if (name === 'truncate') {
+      send(request.id, { content: [{ type: 'text', text: JSON.stringify({ ok: true, rows: 50, truncated: true }) }] });
       return;
     }
     if (name === 'summarize') {

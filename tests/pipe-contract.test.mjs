@@ -9,7 +9,7 @@ import { HelaRuntime } from '../dist/daemon.js';
 import { buildDigest } from '../dist/manifest.js';
 
 const fixture = new URL('./fixtures/mcp-cell.mjs', import.meta.url);
-const TOOLS = ['echo', 'hang', 'hold', 'crash', 'agent_run', 'fail', 'summarize'];
+const TOOLS = ['echo', 'hang', 'hold', 'crash', 'agent_run', 'fail', 'summarize', 'degrade', 'truncate'];
 
 function sandbox() {
   const root = mkdtempSync(path.join(os.tmpdir(), 'ecosystem-pipe-'));
@@ -60,6 +60,7 @@ test('a failing step makes the pipe report failure and stop', { timeout: 10000 }
 
   const body = payload(response);
   assert.equal(body.ok, false, 'ok must reflect the failed step');
+  assert.equal(body.status, 'failed');
   assert.equal(body.failedStep, 1);
   assert.equal(body.steps, 2, 'the third step must not run when onError defaults to stop');
   assert.equal(body.results[0].ok, true);
@@ -67,6 +68,51 @@ test('a failing step makes the pipe report failure and stop', { timeout: 10000 }
   assert.match(body.results[1].error, /boom/);
   assert.equal(response.isError, true);
   assert.ok(!events(box).some((event) => event.event === 'summarize'), 'stopped pipe must not call later steps');
+});
+
+test('a clean pipe reports status ok', { timeout: 10000 }, async (t) => {
+  const { client } = await connect(t);
+  const response = await client.callTool({
+    name: 'hela.pipe',
+    arguments: { steps: [
+      { cell: 'hela-fixture', tool: 'echo' },
+      { cell: 'hela-fixture', tool: 'summarize', args: { text: '{{prev}}' } },
+    ] },
+  });
+  const body = payload(response);
+  assert.equal(body.ok, true);
+  assert.equal(body.status, 'ok');
+  assert.equal(body.degraded, undefined);
+  assert.deepEqual(body.results.map((step) => step.status), ['ok', 'ok']);
+});
+
+test('a degraded step makes the pipe report degraded, not clean success', { timeout: 10000 }, async (t) => {
+  const { client } = await connect(t);
+  const response = await client.callTool({
+    name: 'hela.pipe',
+    arguments: { steps: [
+      { cell: 'hela-fixture', tool: 'degrade' },
+      { cell: 'hela-fixture', tool: 'summarize', args: { text: '{{prev}}' } },
+    ] },
+  });
+  const body = payload(response);
+  assert.equal(body.ok, true, 'the step still produced a result');
+  assert.equal(body.status, 'degraded', 'lossiness must be visible in the shape');
+  assert.equal(response.isError, undefined);
+  assert.equal(body.results[0].status, 'degraded');
+  assert.deepEqual(body.degraded[0].reasons, ['two rows dropped: no id field']);
+  assert.equal(body.degraded[0].step, 0);
+});
+
+test('truncated output is degraded even when the step reports ok', { timeout: 10000 }, async (t) => {
+  const { client } = await connect(t);
+  const response = await client.callTool({
+    name: 'hela.pipe',
+    arguments: { steps: [{ cell: 'hela-fixture', tool: 'truncate' }] },
+  });
+  const body = payload(response);
+  assert.equal(body.status, 'degraded');
+  assert.deepEqual(body.degraded[0].reasons, ['truncated']);
 });
 
 test('onError=continue never pipes a failure payload onward as data', { timeout: 10000 }, async (t) => {
