@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { classifyToolResult } from './outcome.js';
 
 /**
  * Runtime-native Needle agent.
@@ -284,11 +285,26 @@ export function scoreTools(tools: AgentTool[], task: string, queryExtra = ''): A
   return scoreDocs(buildDocs(tools), task, queryExtra);
 }
 
+// "Do not modify any files", "never write", "without changing": the task forbids writes.
+const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n]{0,40}?\b(?:modif\w*|chang\w*|edit\w*|writ\w*|creat\w*|delet\w*|remov\w*|alter\w*|overwrit\w*|touch\w*|mutat\w*|sav\w*)/i;
+const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|insert|update|rename|truncate|import|archive|upload|drop)(_|$)/i;
+
+/**
+ * When the task forbids modification, keep mutating tools out of the shortlist (retrieval
+ * ranked write_file first for "Do not modify any files"). If nothing else is left, keep
+ * them rather than return an empty list.
+ */
+export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
+  if (!NEGATED_WRITE.test(task)) return tools;
+  const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
+  return safe.length ? safe : tools;
+}
+
 export function retrieveTools(tools: AgentTool[], task: string, history: HistoryStep[] = [], limit = MAX_SHORTLIST): AgentTool[] {
   const last = [...history].reverse().find((step) => step.ok && step.result);
   const queryExtra = last ? `${last.tool} ${last.result?.slice(0, 500) ?? ''}` : '';
-  const ranked = scoreTools(tools, task, queryExtra);
-  return ranked.slice(0, limit).map((entry) => entry.tool);
+  const ranked = scoreTools(tools, task, queryExtra).map((entry) => entry.tool);
+  return avoidMutatingTools(ranked, task).slice(0, limit);
 }
 
 /* ── deterministic task shaping ────────────────────────────────────────── */
@@ -952,6 +968,11 @@ export class NativeNeedleAgent {
     let iterations = 0;
     let toolCalls = 0;
     let decision = 'running';
+    let succeeded = 0;
+    let failedCount = 0;
+    let lastCallOk: boolean | undefined;
+    const degradedReasons: string[] = [];
+    const failedCalls = new Map<string, string>();
 
     while (iterations < maxIterations && toolCalls < maxToolCalls && Date.now() - started < maxExecutionMs) {
       iterations++;
@@ -1015,20 +1036,39 @@ export class NativeNeedleAgent {
         continue;
       }
 
+      // The same call with the same arguments already failed: running it again cannot help.
+      const callKey = `${chosen.name}\u0000${JSON.stringify(repaired.args)}`;
+      if (failedCalls.has(callKey)) {
+        decision = `repeated failing call skipped (${chosen.name}): ${failedCalls.get(callKey)}`;
+        break;
+      }
+
       const callStarted = Date.now();
       try {
         const result = await this.host.executeAgentTool(chosen, repaired.args);
         const ms = Date.now() - callStarted;
         toolCalls++;
+        // Cells report failure in the payload (isError, success:false, ok:false), not by
+        // throwing; counting a returned error payload as success hid failed runs (runtime#4).
+        const outcome = classifyToolResult(result);
         history.push({
           iteration: iterations,
           intent: intentForTool(chosen.name),
           tool: chosen.name,
           args: repaired.args,
-          ok: true,
+          ok: outcome.ok,
+          ...(outcome.ok ? {} : { error: outcome.error }),
           result: asText(result),
           ms,
         });
+        lastCallOk = outcome.ok;
+        if (!outcome.ok) {
+          failedCount++;
+          failedCalls.set(callKey, outcome.error ?? 'failed');
+          continue;
+        }
+        succeeded++;
+        for (const reason of outcome.degraded) if (!degradedReasons.includes(reason)) degradedReasons.push(reason);
         if (!planned.length) {
           // Without a deterministic plan there is no completion predicate;
           // stop after the first successful action instead of repeating it
@@ -1037,15 +1077,19 @@ export class NativeNeedleAgent {
           break;
         }
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         history.push({
           iteration: iterations,
           intent: intentForTool(chosen.name),
           tool: chosen.name,
           args: repaired.args,
           ok: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: message,
           ms: Date.now() - callStarted,
         });
+        lastCallOk = false;
+        failedCount++;
+        failedCalls.set(callKey, message);
       }
     }
 
@@ -1054,8 +1098,15 @@ export class NativeNeedleAgent {
         ? 'plan complete'
         : toolCalls ? 'iteration or time limit reached' : 'no tool executed';
     }
+    // ok means a call succeeded and the last word was not a failure; degraded means some calls
+    // failed along the way or succeeded only partially (same vocabulary as hela_pipe).
+    const failed = succeeded === 0 || lastCallOk === false || decision.startsWith('repeated failing call');
+    const status = failed ? 'failed' : failedCount > 0 || degradedReasons.length ? 'degraded' : 'ok';
     return {
-      ok: toolCalls > 0,
+      ok: status !== 'failed',
+      status,
+      ...(failedCount ? { failedCalls: failedCount } : {}),
+      ...(degradedReasons.length ? { degraded: degradedReasons } : {}),
       workflowId: `native-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       sessionId: `native-${Math.random().toString(36).slice(2, 10)}`,
       planner: 'needle3',
@@ -1063,7 +1114,7 @@ export class NativeNeedleAgent {
       catalog: { total: catalog.length, retrieved: [...retrievedNames] },
       plan: planned,
       notes,
-      decision: { action: toolCalls > 0 ? 'executed' : 'stop', reason: decision },
+      decision: { action: failed ? (toolCalls > 0 ? 'failed' : 'stop') : 'executed', reason: decision },
       toolCalls,
       iterations,
       escalated: false,
