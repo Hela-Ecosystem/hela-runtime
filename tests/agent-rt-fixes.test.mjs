@@ -54,3 +54,33 @@ test('RT-03: a task-wide write ban still blocks mutating tools', async () => {
     assert.ok(!avoidMutatingTools(catalog, task).some((entry) => entry.name === 'copy_file' || entry.name === 'write_file'), task);
   }
 });
+
+test('RT-04: a transient read timeout gets one bounded retry, a permanent error none', async () => {
+  const task = 'Read notes.txt';
+  let calls = 0;
+  const recovered = await agentWith(async () => (++calls === 1 ? envelope({ success: false, error: 'Request timed out after 30000ms' }) : envelope('notes')), ['read_file'])
+    .run({ task, maxIterations: 5, maxToolCalls: 5 });
+  assert.equal(calls, 2);
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.status, 'degraded');
+  assert.equal(recovered.failedCalls, 1);
+
+  calls = 0;
+  const stuck = await agentWith(async () => { calls++; throw new Error('ETIMEDOUT'); }, ['read_file']).run({ task, maxIterations: 8, maxToolCalls: 8 });
+  assert.equal(calls, 2, 'one retry, never more');
+  assert.equal(stuck.status, 'failed');
+  assert.match(stuck.decision.reason, /repeated failing call skipped/);
+
+  calls = 0;
+  const permanent = await agentWith(async () => { calls++; return envelope({ success: false, error: 'ENOENT: no such file' }); }, ['read_file']).run({ task, maxIterations: 8, maxToolCalls: 8 });
+  assert.equal(calls, 1);
+  assert.equal(permanent.status, 'failed');
+});
+
+test('RT-04: a timed-out copy (mutating) is never retried', async () => {
+  let calls = 0;
+  const result = await agentWith(async () => { calls++; return envelope({ success: false, error: 'timed out' }); }, ['copy_file'])
+    .run({ task: 'Copy /tmp/a.txt to /tmp/b.txt', maxIterations: 6, maxToolCalls: 6 });
+  assert.equal(calls, 1);
+  assert.equal(result.status, 'failed');
+});

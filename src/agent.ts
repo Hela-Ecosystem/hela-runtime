@@ -301,6 +301,14 @@ const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|ins
  * ranked write_file first for "Do not modify any files"). If nothing else is left, keep
  * them rather than return an empty list.
  */
+const MAX_TRANSIENT_RETRIES = 1;
+const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
+
+/** Only a non-mutating tool failing with a timeout-like error is worth one more attempt. */
+function isTransientReadFailure(toolName: string, error: string): boolean {
+  return !MUTATING_TOOL.test(toolName) && TRANSIENT_ERROR.test(error);
+}
+
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
   if (!forbidsWrites(task)) return tools;
   const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
@@ -986,7 +994,10 @@ export class NativeNeedleAgent {
     let failedCount = 0;
     let lastCallOk: boolean | undefined;
     const degradedReasons: string[] = [];
-    const failedCalls = new Map<string, string>();
+    const failedCalls = new Map<string, { error: string; retries: number; transient: boolean }>();
+    const recordFailure = (key: string, toolName: string, error: string) => {
+      failedCalls.set(key, { error, retries: failedCalls.get(key)?.retries ?? 0, transient: isTransientReadFailure(toolName, error) });
+    };
 
     while (iterations < maxIterations && toolCalls < maxToolCalls && Date.now() - started < maxExecutionMs) {
       iterations++;
@@ -1052,9 +1063,14 @@ export class NativeNeedleAgent {
 
       // The same call with the same arguments already failed: running it again cannot help.
       const callKey = `${chosen.name}\u0000${JSON.stringify(repaired.args)}`;
-      if (failedCalls.has(callKey)) {
-        decision = `repeated failing call skipped (${chosen.name}): ${failedCalls.get(callKey)}`;
-        break;
+      // A transient read failure (timeout, cell restart) gets one bounded retry.
+      const previousFailure = failedCalls.get(callKey);
+      if (previousFailure) {
+        if (!previousFailure.transient || previousFailure.retries >= MAX_TRANSIENT_RETRIES) {
+          decision = `repeated failing call skipped (${chosen.name}): ${previousFailure.error}`;
+          break;
+        }
+        previousFailure.retries++;
       }
 
       const callStarted = Date.now();
@@ -1078,7 +1094,7 @@ export class NativeNeedleAgent {
         lastCallOk = outcome.ok;
         if (!outcome.ok) {
           failedCount++;
-          failedCalls.set(callKey, outcome.error ?? 'failed');
+          recordFailure(callKey, chosen.name, outcome.error ?? 'failed');
           continue;
         }
         succeeded++;
@@ -1103,7 +1119,7 @@ export class NativeNeedleAgent {
         });
         lastCallOk = false;
         failedCount++;
-        failedCalls.set(callKey, message);
+        recordFailure(callKey, chosen.name, message);
       }
     }
 
