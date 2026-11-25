@@ -9,7 +9,7 @@
 
 export interface ToolOutcome {
   ok: boolean;
-  /** Parsed JSON body when the text is JSON, otherwise the joined text (or the raw object). */
+  /** Structured content, parsed or joined text content, or the raw value. */
   payload: unknown;
   /** Why the call failed; set only when `ok` is false. */
   error?: string;
@@ -39,36 +39,29 @@ export function degradationReasons(structured: unknown): string[] {
 
 /** Classify the value a cell (or a runtime-hosted tool) returned. Never throws. */
 export function classifyToolResult(res: unknown): ToolOutcome {
-  const envelope = res as { content?: Array<{ type?: string; text?: string }>; isError?: boolean } | undefined | null;
-  const hasEnvelope = !!envelope && typeof envelope === 'object' && Array.isArray(envelope.content);
-  const text = hasEnvelope
-    ? envelope!.content!
-        .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-        .map((part) => part.text as string)
-        .join('\n')
-    : '';
+  const envelope = res !== null && typeof res === 'object' ? res as Record<string, unknown> : undefined;
+  const content = Array.isArray(envelope?.content) ? envelope.content as Array<{ type?: string; text?: string }> : undefined;
+  const text = content
+    ?.filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('\n') ?? '';
 
-  let structured: unknown;
-  if (hasEnvelope) {
+  let payload = res;
+  if (envelope?.structuredContent !== undefined) {
+    payload = envelope.structuredContent;
+  } else if (content) {
     try {
-      structured = JSON.parse(text);
+      payload = JSON.parse(text);
     } catch {
-      structured = undefined;
+      payload = text;
     }
-  } else if (res !== null && typeof res === 'object') {
-    // Runtime-hosted tools return a plain object rather than an MCP envelope.
-    structured = res;
   }
 
-  const record = structured !== null && typeof structured === 'object' ? (structured as Record<string, unknown>) : undefined;
-  const failed = (hasEnvelope && envelope!.isError === true) || record?.success === false || record?.ok === false;
+  const record = payload !== null && typeof payload === 'object' ? payload as Record<string, unknown> : undefined;
+  const failed = envelope?.isError === true || record?.success === false || record?.ok === false;
   if (!failed) {
-    return {
-      ok: true,
-      payload: structured !== undefined ? structured : hasEnvelope ? text : res,
-      degraded: degradationReasons(structured),
-    };
+    return { ok: true, payload, degraded: degradationReasons(payload) };
   }
   const reason = record?.error ?? record?.message ?? (text ? text.slice(0, 300) : 'step failed');
-  return { ok: false, payload: structured !== undefined ? structured : text, error: String(reason), degraded: [] };
+  return { ok: false, payload, error: String(reason), degraded: [] };
 }

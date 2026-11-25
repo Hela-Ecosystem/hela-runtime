@@ -29,8 +29,8 @@ const EISDIR = envelope({ success: false, message: 'Failed to read file: EISDIR:
 
 // The live repro from runtime#4. Needle is stubbed: the loop, not the model, is under test.
 const TASK = 'Tell me the current time in Asia/Jakarta. Do not modify any files.';
-function agentWith(executeAgentTool, picks) {
-  const host = { agentCatalog: () => catalog, agentContext: () => ({ workspaceRoot: '/tmp/ws', cwd: '/tmp/cwd' }), executeAgentTool };
+function agentWith(executeAgentTool, picks, tools = catalog) {
+  const host = { agentCatalog: () => tools, agentContext: () => ({ workspaceRoot: '/tmp/ws', cwd: '/tmp/cwd' }), executeAgentTool };
   const agent = new NativeNeedleAgent(host, { root: assetRoot, profile: null });
   const queue = [...picks];
   agent.choose = async () => (queue.length > 1 ? queue.shift() : queue[0]);
@@ -53,6 +53,57 @@ test('classifyToolResult: failure is read from the payload, not from whether the
   assert.deepEqual(degraded.degraded, ['status=degraded', 'truncated at 5 MB']);
   assert.doesNotThrow(() => classifyToolResult(undefined));
   assert.doesNotThrow(() => classifyToolResult(null));
+});
+
+test('classifyToolResult: structured payloads and isError work without text content', () => {
+  const structuredContent = { ok: false, error: 'boom' };
+  const failed = classifyToolResult({ structuredContent, isError: true });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.payload, structuredContent);
+  assert.equal(failed.error, 'boom');
+  assert.equal(classifyToolResult({ structuredContent }).ok, false);
+  assert.equal(classifyToolResult({ isError: true }).ok, false);
+});
+
+test('classifyToolResult: structured degradation takes precedence over a text summary', () => {
+  const structuredContent = { ok: true, partial: true, truncated: true, warnings: ['missing rows'] };
+  const outcome = classifyToolResult({ ...envelope('Found some rows'), structuredContent });
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.payload, structuredContent);
+  assert.deepEqual(outcome.degraded, ['partial', 'truncated', 'missing rows']);
+});
+
+test('agent_run: a read with a task-wide edit prohibition executes only read_file', async () => {
+  const seen = [];
+  const agent = agentWith(async (selected) => {
+    seen.push(selected.name);
+    return envelope('notes');
+  }, ['write_file']);
+  const task = 'Read notes.txt. Do not edit any files.';
+  const result = await agent.run({ task });
+  assert.deepEqual(seen, ['read_file']);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.plan.map((step) => step.tool), ['read_file']);
+});
+
+test('agent_run: a stubbed write choice cannot override a task-wide prohibition', async () => {
+  const seen = [];
+  const onlyWrites = catalog.filter((entry) => entry.name === 'write_file');
+  const agent = agentWith(async (selected) => {
+    seen.push(selected.name);
+    return envelope({ ok: true });
+  }, ['write_file'], onlyWrites);
+  const result = await agent.run({ task: TASK });
+  assert.deepEqual(seen, []);
+  assert.equal(result.ok, false);
+  assert.equal(result.toolCalls, 0);
+  assert.match(result.decision.reason, /no (?:permitted|safe) tool/i);
+});
+
+test('agent_plan: an ordinary write still plans write_file', async () => {
+  const agent = agentWith(async () => assert.fail('plan should never execute tools'), []);
+  const result = await agent.plan({ task: 'Write hello to notes.txt' });
+  assert.deepEqual(result.plan.map((step) => step.tool), ['write_file']);
 });
 
 test('agent_run: a failed payload is a failed run, not "single action complete"', async () => {
