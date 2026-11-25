@@ -286,8 +286,37 @@ export function scoreTools(tools: AgentTool[], task: string, queryExtra = ''): A
 }
 
 // "Do not modify any files", "never write", "without changing": the task forbids writes.
-const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n]{0,40}?\b(?:modif\w*|chang\w*|edit\w*|writ\w*|creat\w*|delet\w*|remov\w*|alter\w*|overwrit\w*|touch\w*|mutat\w*|sav\w*)/i;
+const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n]{0,40}?\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*((?:[^.!?\n,;]|\.(?=\w)){0,60})/gi;
+// "without modifying the original": the ban protects the task's own input, so producing a new output stays allowed.
+// A ban naming a concrete file or path ("do not change /tmp/a.txt") stays a full ban: the runtime cannot yet tell
+// whether a chosen write would land on that file, so every mutating tool is withheld.
+const PROTECTED_INPUT = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input)\b/i;
+
+/** True when the task bans writes outright; only a ban scoped to the task's own input leaves other writes allowed. */
+export function forbidsWrites(task: string): boolean {
+  return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
+}
 const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|insert|update|rename|truncate|import|archive|upload|drop)(_|$)/i;
+
+const MAX_TRANSIENT_RETRIES = 1;
+const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
+
+/** Only a non-mutating tool failing with a timeout-like error is worth one more attempt. */
+function isTransientReadFailure(toolName: string, error: string): boolean {
+  return !MUTATING_TOOL.test(toolName) && TRANSIENT_ERROR.test(error);
+}
+
+/**
+ * Does a successful call plausibly answer an unplanned task? True when the tool's name speaks to
+ * the task (negated clauses like "do not modify any files" excluded) or its result repeats a distinctive word of the task.
+ */
+export function addressesTask(tool: AgentTool, task: string, resultText: string): boolean {
+  const subject = task.replace(NEGATED_WRITE, ' ');
+  const query = new Set(expandQuery(tokenize(subject)));
+  if (tokenize(tool.name.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
+  const result = resultText.toLowerCase();
+  return tokenize(subject).some((token) => token.length >= 4 && result.includes(token));
+}
 
 /**
  * When the task forbids modification, keep mutating tools out of the shortlist (retrieval
@@ -295,7 +324,7 @@ const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|ins
  * them rather than return an empty list.
  */
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
-  if (!NEGATED_WRITE.test(task)) return tools;
+  if (!forbidsWrites(task)) return tools;
   const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
   return safe.length ? safe : tools;
 }
@@ -434,6 +463,7 @@ function intentForTool(name: string): string {
   if (name === 'list_directory' || name === 'terminal_ls') return 'list';
   if (name === 'read_file' || name === 'terminal_cat') return 'read';
   if (name === 'write_file') return 'write';
+  if (name === 'copy_file') return 'copy';
   if (name === 'find_files') return 'find';
   if (name === 'browser_navigate') return 'navigate';
   if (name === 'browser_type') return 'type';
@@ -490,7 +520,12 @@ function planFor(task: string): PlannedStep[] {
     return steps;
   }
 
-  const write = !browser && !NEGATED_WRITE.test(task) && hasAny(lower, /\b(write|create|save|make|append|edit)\b/) && (extractFilename(task) !== undefined || hasAny(lower, /\b(file|note|notes|document)\b/));
+  if (!browser && !forbidsWrites(task) && hasAny(lower, /\b(copy|duplicate)\b/) && (extractFilename(task) !== undefined || hasAny(lower, /\b(file|files)\b/))) {
+    steps.push({ intent: 'copy', tool: 'copy_file', description: 'copy the requested file' });
+    return steps;
+  }
+
+  const write = !browser && !forbidsWrites(task) && hasAny(lower, /\b(write|create|save|make|append|edit)\b/) && (extractFilename(task) !== undefined || hasAny(lower, /\b(file|note|notes|document)\b/));
   if (write) {
     steps.push({ intent: 'write', tool: 'write_file', description: 'write the requested file' });
     return steps;
@@ -934,7 +969,7 @@ export class NativeNeedleAgent {
 
   async plan(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const task = String(args.task ?? '').trim();
-    if (!task) return { ok: false, error: 'task is required' };
+    if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const catalog = this.catalog();
     const plan = planFor(task);
     const retrieved = retrieveTools(catalog, task, [], Math.max(MAX_SHORTLIST, Number(args.limit) || MAX_SHORTLIST));
@@ -951,18 +986,18 @@ export class NativeNeedleAgent {
 
   async run(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const task = String(args.task ?? '').trim();
-    if (!task) return { ok: false, error: 'task is required' };
+    if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const maxIterations = clamp(args.maxIterations, 1, 20, 8);
     const maxToolCalls = clamp(args.maxToolCalls, 1, 30, 12);
     const maxExecutionMs = clamp(args.maxExecutionMs, 1000, 300000, 180000);
     const started = Date.now();
     const catalog = this.catalog();
-    if (!catalog.length) return { ok: false, error: 'runtime tool catalog is empty' };
+    if (!catalog.length) return { ok: false, status: 'failed', error: 'runtime tool catalog is empty' };
     const health = this.health();
-    if (!health.ok) return { ok: false, error: health.detail, health };
+    if (!health.ok) return { ok: false, status: 'failed', error: health.detail, health };
 
     const planned = planFor(task);
-    const readOnly = NEGATED_WRITE.test(task);
+    const readOnly = forbidsWrites(task);
     const history: HistoryStep[] = [];
     const notes: string[] = [];
     const retrievedNames = new Set<string>();
@@ -972,8 +1007,13 @@ export class NativeNeedleAgent {
     let succeeded = 0;
     let failedCount = 0;
     let lastCallOk: boolean | undefined;
+    let answered = false;
+    const unanswered = new Set<string>();
     const degradedReasons: string[] = [];
-    const failedCalls = new Map<string, string>();
+    const failedCalls = new Map<string, { error: string; retries: number; transient: boolean }>();
+    const recordFailure = (key: string, toolName: string, error: string) => {
+      failedCalls.set(key, { error, retries: failedCalls.get(key)?.retries ?? 0, transient: isTransientReadFailure(toolName, error) });
+    };
 
     while (iterations < maxIterations && toolCalls < maxToolCalls && Date.now() - started < maxExecutionMs) {
       iterations++;
@@ -995,7 +1035,8 @@ export class NativeNeedleAgent {
         shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST);
       }
       if (readOnly) shortlist = shortlist.filter((tool) => !MUTATING_TOOL.test(tool.name));
-      if (!shortlist.length) { decision = readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
+      if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.name === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
 
@@ -1003,7 +1044,7 @@ export class NativeNeedleAgent {
       try {
         chosenName = await this.choose(shortlist, task, step, history);
       } catch (error) {
-        return { ok: false, error: error instanceof Error ? error.message : String(error), health, plan: planned, history };
+        return { ok: false, status: 'failed', error: error instanceof Error ? error.message : String(error), health, plan: planned, history };
       }
 
       if (chosenName === DONE_TOOL) {
@@ -1039,9 +1080,14 @@ export class NativeNeedleAgent {
 
       // The same call with the same arguments already failed: running it again cannot help.
       const callKey = `${chosen.name}\u0000${JSON.stringify(repaired.args)}`;
-      if (failedCalls.has(callKey)) {
-        decision = `repeated failing call skipped (${chosen.name}): ${failedCalls.get(callKey)}`;
-        break;
+      // A transient read failure (timeout, cell restart) gets one bounded retry.
+      const previousFailure = failedCalls.get(callKey);
+      if (previousFailure) {
+        if (!previousFailure.transient || previousFailure.retries >= MAX_TRANSIENT_RETRIES) {
+          decision = `repeated failing call skipped (${chosen.name}): ${previousFailure.error}`;
+          break;
+        }
+        previousFailure.retries++;
       }
 
       const callStarted = Date.now();
@@ -1065,17 +1111,22 @@ export class NativeNeedleAgent {
         lastCallOk = outcome.ok;
         if (!outcome.ok) {
           failedCount++;
-          failedCalls.set(callKey, outcome.error ?? 'failed');
+          recordFailure(callKey, chosen.name, outcome.error ?? 'failed');
           continue;
         }
         succeeded++;
         for (const reason of outcome.degraded) if (!degradedReasons.includes(reason)) degradedReasons.push(reason);
         if (!planned.length) {
-          // Without a deterministic plan there is no completion predicate;
-          // stop after the first successful action instead of repeating it
-          // until the iteration cap.
-          decision = `single action complete (${chosen.name})`;
-          break;
+          // Without a deterministic plan the completion predicate is "the result addresses the
+          // task": a non-failing call to an unrelated tool (runtime#4: watch_file for a time
+          // question) is not an answer, so try other tools until the budget runs out.
+          if (addressesTask(chosen, task, asText(result))) {
+            answered = true;
+            decision = `single action complete (${chosen.name})`;
+            break;
+          }
+          unanswered.add(chosen.name);
+          notes.push(`${chosen.name} succeeded but its result does not address the task`);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1090,7 +1141,7 @@ export class NativeNeedleAgent {
         });
         lastCallOk = false;
         failedCount++;
-        failedCalls.set(callKey, message);
+        recordFailure(callKey, chosen.name, message);
       }
     }
 
@@ -1102,11 +1153,16 @@ export class NativeNeedleAgent {
     // ok means a call succeeded and the last word was not a failure; degraded means some calls
     // failed along the way or succeeded only partially (same vocabulary as hela_pipe).
     const failed = succeeded === 0 || lastCallOk === false || decision.startsWith('repeated failing call');
+    // A plan cut short (tool budget, time, no permitted tool) is partial, never a full success.
+    const pendingSteps = planned.filter((step) => !completed(step, history)).map((step) => step.intent);
+    if (!failed && !planned.length && !answered) degradedReasons.push('no tool result addressed the task');
+    if (!failed && pendingSteps.length) degradedReasons.push(`pending steps not run: ${pendingSteps.join(', ')}`);
     const status = failed ? 'failed' : failedCount > 0 || degradedReasons.length ? 'degraded' : 'ok';
     return {
       ok: status !== 'failed',
       status,
       ...(failedCount ? { failedCalls: failedCount } : {}),
+      ...(pendingSteps.length ? { pendingSteps } : {}),
       ...(degradedReasons.length ? { degraded: degradedReasons } : {}),
       workflowId: `native-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       sessionId: `native-${Math.random().toString(36).slice(2, 10)}`,
