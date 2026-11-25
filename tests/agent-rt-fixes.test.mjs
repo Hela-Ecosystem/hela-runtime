@@ -84,3 +84,47 @@ test('RT-04: a timed-out copy (mutating) is never retried', async () => {
   assert.equal(calls, 1);
   assert.equal(result.status, 'failed');
 });
+
+test('RT-05: a plan cut short by maxToolCalls is degraded, not ok', async () => {
+  const seen = [];
+  const result = await agentWith(async (selected) => { seen.push(selected.name); return envelope({ done: true }); }, ['browser_navigate', 'browser_screenshot'])
+    .run({ task: 'Open https://example.com and take a screenshot', maxIterations: 6, maxToolCalls: 1 });
+  assert.deepEqual(seen, ['browser_navigate']);
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'degraded');
+  assert.ok(result.degraded.some((reason) => /pending.*screenshot/i.test(reason)), JSON.stringify(result.degraded));
+  assert.deepEqual(result.pendingSteps, ['screenshot']);
+
+  const full = await agentWith(async () => envelope({ done: true }), ['browser_navigate', 'browser_screenshot'])
+    .run({ task: 'Open https://example.com and take a screenshot', maxIterations: 6, maxToolCalls: 5 });
+  assert.equal(full.status, 'ok');
+  assert.equal(full.pendingSteps, undefined);
+});
+
+test('RT-06: early exits report status failed', async () => {
+  const agent = agentWith(async () => envelope('x'), ['read_file']);
+  const missing = await agent.run({ task: '   ' });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.status, 'failed');
+
+  const empty = await agentWith(async () => envelope('x'), ['read_file'], []).run({ task: 'Read notes.txt' });
+  assert.equal(empty.ok, false);
+  assert.equal(empty.status, 'failed');
+
+  const unhealthy = agentWith(async () => envelope('x'), ['read_file']);
+  unhealthy.health = () => ({ ok: false, detail: 'engine unavailable' });
+  const down = await unhealthy.run({ task: 'Read notes.txt' });
+  assert.equal(down.ok, false);
+  assert.equal(down.status, 'failed');
+
+  const throwing = agentWith(async () => envelope('x'), ['read_file']);
+  throwing.choose = async () => { throw new Error('planner exploded'); };
+  const thrown = await throwing.run({ task: 'Read notes.txt' });
+  assert.equal(thrown.ok, false);
+  assert.equal(thrown.status, 'failed');
+  assert.match(thrown.error, /planner exploded/);
+
+  const plan = await agent.plan({ task: '' });
+  assert.equal(plan.ok, false);
+  assert.equal(plan.status, 'failed');
+});

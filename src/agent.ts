@@ -955,7 +955,7 @@ export class NativeNeedleAgent {
 
   async plan(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const task = String(args.task ?? '').trim();
-    if (!task) return { ok: false, error: 'task is required' };
+    if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const catalog = this.catalog();
     const plan = planFor(task);
     const retrieved = retrieveTools(catalog, task, [], Math.max(MAX_SHORTLIST, Number(args.limit) || MAX_SHORTLIST));
@@ -972,15 +972,15 @@ export class NativeNeedleAgent {
 
   async run(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const task = String(args.task ?? '').trim();
-    if (!task) return { ok: false, error: 'task is required' };
+    if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const maxIterations = clamp(args.maxIterations, 1, 20, 8);
     const maxToolCalls = clamp(args.maxToolCalls, 1, 30, 12);
     const maxExecutionMs = clamp(args.maxExecutionMs, 1000, 300000, 180000);
     const started = Date.now();
     const catalog = this.catalog();
-    if (!catalog.length) return { ok: false, error: 'runtime tool catalog is empty' };
+    if (!catalog.length) return { ok: false, status: 'failed', error: 'runtime tool catalog is empty' };
     const health = this.health();
-    if (!health.ok) return { ok: false, error: health.detail, health };
+    if (!health.ok) return { ok: false, status: 'failed', error: health.detail, health };
 
     const planned = planFor(task);
     const readOnly = forbidsWrites(task);
@@ -1027,7 +1027,7 @@ export class NativeNeedleAgent {
       try {
         chosenName = await this.choose(shortlist, task, step, history);
       } catch (error) {
-        return { ok: false, error: error instanceof Error ? error.message : String(error), health, plan: planned, history };
+        return { ok: false, status: 'failed', error: error instanceof Error ? error.message : String(error), health, plan: planned, history };
       }
 
       if (chosenName === DONE_TOOL) {
@@ -1131,11 +1131,15 @@ export class NativeNeedleAgent {
     // ok means a call succeeded and the last word was not a failure; degraded means some calls
     // failed along the way or succeeded only partially (same vocabulary as hela_pipe).
     const failed = succeeded === 0 || lastCallOk === false || decision.startsWith('repeated failing call');
+    // A plan cut short (tool budget, time, no permitted tool) is partial, never a full success.
+    const pendingSteps = planned.filter((step) => !completed(step, history)).map((step) => step.intent);
+    if (!failed && pendingSteps.length) degradedReasons.push(`pending steps not run: ${pendingSteps.join(', ')}`);
     const status = failed ? 'failed' : failedCount > 0 || degradedReasons.length ? 'degraded' : 'ok';
     return {
       ok: status !== 'failed',
       status,
       ...(failedCount ? { failedCalls: failedCount } : {}),
+      ...(pendingSteps.length ? { pendingSteps } : {}),
       ...(degradedReasons.length ? { degraded: degradedReasons } : {}),
       workflowId: `native-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       sessionId: `native-${Math.random().toString(36).slice(2, 10)}`,
