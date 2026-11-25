@@ -9,6 +9,8 @@ export interface BootOptions {
   timeoutMs?: number;
   shutdownGraceMs?: number;
   signal?: AbortSignal;
+  /** Extra environment for this cell, layered over the runtime's own. */
+  env?: Record<string, string>;
 }
 
 /** One line of the cell's JSON-RPC stream, before any payload is trusted. */
@@ -148,7 +150,7 @@ export async function bootCell(spec: CellSpec, opts: BootOptions): Promise<CellH
   opts.signal?.throwIfAborted();
   const dir = resolveDir(spec, opts.root);
   const timeoutMs = opts.timeoutMs ?? 15000;
-  const proc = spawn(process.execPath, [path.join(dir, spec.entry)], { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
+  const proc = spawn(process.execPath, [path.join(dir, spec.entry)], { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...opts.env } });
   let resolveExit!: () => void;
   const handle: CellHandle = {
     key: spec.id,

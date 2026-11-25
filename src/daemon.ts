@@ -16,6 +16,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { HttpAdapter } from './http-adapter.js';
 import { spawn } from 'node:child_process';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
@@ -143,6 +145,7 @@ export class HelaRuntime {
   private booted = false;
   private shutdownTask?: Promise<void>;
   private bootAbort = new AbortController();
+  private internalEndpoint?: { adapter: HttpAdapter; url: Promise<string> };
   private healthServer?: http.Server;
   private manifests!: ManifestStore;
   manifestSources = new Map<string, 'cache' | 'catalog' | 'missing' | 'live'>();
@@ -319,6 +322,26 @@ export class HelaRuntime {
     return boot;
   }
 
+  /**
+   * Cells that fan out to other cells (Mitosis workflows) call back through `hela.pipe`, which
+   * needs an MCP endpoint. An operator-set HELA_RUNTIME_URL wins; otherwise the runtime serves a
+   * loopback-only endpoint on an ephemeral port whose path is a random capability, so no other
+   * local process can use it without being handed the URL.
+   */
+  private cellEnvironment(spec: CellSpec): Promise<Record<string, string> | undefined> {
+    if (spec.id !== 'hela-mitosis' || process.env.HELA_RUNTIME_URL) return Promise.resolve(undefined);
+    if (!this.internalEndpoint) {
+      const secretPath = `/mcp/${randomBytes(16).toString('hex')}`;
+      const adapter = new HttpAdapter(() => { const s = this.createServer(); this.attachHandlers(s); return s; }, { port: 0, host: '127.0.0.1', secretPath });
+      this.internalEndpoint = { adapter, url: adapter.start().then(() => `http://127.0.0.1:${adapter.boundPort}${secretPath}`) };
+    }
+    return this.internalEndpoint.url.then((url) => ({ HELA_RUNTIME_URL: url }), (error) => {
+      this.internalEndpoint = undefined;
+      console.error(`[hela-runtime] internal endpoint unavailable: ${error instanceof Error ? error.message : error}`);
+      return undefined;
+    });
+  }
+
   private async startCell(spec: CellSpec): Promise<void> {
     this.metric(spec.id).starts++;
     try {
@@ -329,6 +352,7 @@ export class HelaRuntime {
         timeoutMs: this.options.bootTimeoutMs ?? 60000,
         shutdownGraceMs: this.options.shutdownGraceMs,
         signal: this.bootAbort.signal,
+        env: await this.cellEnvironment(spec),
       });
       if (this.stopping) {
         await shutdownCell(handle);
@@ -980,6 +1004,7 @@ export class HelaRuntime {
       ...[...this.cells.values()].map((cell) => shutdownCell(cell)),
       ...this.bootTasks.values(),
       this.server.close(),
+      this.internalEndpoint?.adapter.close(),
       new Promise<void>((resolve) => {
         if (this.healthServer) this.healthServer.close(() => resolve());
         else resolve();

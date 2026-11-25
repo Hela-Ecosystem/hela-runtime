@@ -1,3 +1,14 @@
+## [1.4.3] - 2026-11-25
+
+### Fixed
+- Mitosis workflow steps that target another cell work out of the box. The runtime now gives the Mitosis cell `HELA_RUNTIME_URL`: a loopback-only endpoint (`127.0.0.1`, ephemeral port) whose path is a random 128-bit capability, so no other local process can call tools through it without being handed the URL. An operator-set `HELA_RUNTIME_URL` still wins, other cells never receive it, and the listener closes with the runtime. Previously every non-Mitosis step failed with `No runtime transport bound for server '…'` unless the variable was set by hand (chaining-mcp#28, ISS-61).
+
+### Added
+- `bootCell` accepts a per-cell `env` layered over the runtime's environment; `HttpAdapter` accepts a `secretPath` and reports its `boundPort`.
+
+### Tests
+- `tests/runtime-url.test.mjs`: the Mitosis cell receives a loopback capability URL that serves MCP, `/mcp` and `/` are refused on that listener, the endpoint closes on shutdown, other cells see nothing, and an operator-set URL is preserved. Suite 76/76.
+
 ## [1.4.2] - 2026-11-25
 
 ### Fixed
