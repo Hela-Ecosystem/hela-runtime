@@ -27,6 +27,7 @@ const catalog = [
   tool('browser_navigate', 'Open a URL in the browser.', { url: { type: 'string' } }, ['url']),
   tool('browser_screenshot', 'Take a screenshot of the current page.', {}),
 ];
+const MUTATING = /(^|_)(write|copy|create|delete|move)(_|$)/;
 const envelope = (value, isError) => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }], ...(isError ? { isError: true } : {}) });
 
 function agentWith(executeAgentTool, picks, tools = catalog) {
@@ -127,4 +128,39 @@ test('RT-06: early exits report status failed', async () => {
   const plan = await agent.plan({ task: '' });
   assert.equal(plan.ok, false);
   assert.equal(plan.status, 'failed');
+});
+
+// hela-runtime#4: the exact repro. A non-failing call to the wrong tool is not the answer.
+const TIME_TASK = 'Tell me the current time in Asia/Jakarta. Do not modify any files.';
+const WATCHING = envelope({ success: true, message: 'Started watching /data/x' });
+const JAKARTA = envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T21:30:00+07:00' });
+
+test('RT-07: runtime#4 repro - a wrong-tool ok call is not "single action complete"', async () => {
+  const seen = [];
+  const agent = agentWith(async (selected) => { seen.push(selected.name); return selected.name === 'get_current_time' ? JAKARTA : WATCHING; }, ['watch_file', 'get_current_time']);
+  const result = await agent.run({ task: TIME_TASK, maxIterations: 5, maxToolCalls: 5 });
+  assert.deepEqual(seen, ['watch_file', 'get_current_time']);
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'ok');
+  assert.match(result.decision.reason, /single action complete \(get_current_time\)/);
+});
+
+test('RT-07: runtime#4 repro - never answered ends degraded after trying the budget', async () => {
+  const withoutClock = catalog.filter((entry) => entry.name !== 'get_current_time');
+  const seen = [];
+  const agent = agentWith(async (selected) => { seen.push(selected.name); return WATCHING; }, ['watch_file'], withoutClock);
+  const result = await agent.run({ task: TIME_TASK, maxIterations: 8, maxToolCalls: 8 });
+  assert.ok(seen.length >= 1);
+  assert.equal(new Set(seen).size, seen.length, 'a tool whose result did not address the task is not repeated');
+  assert.ok(!seen.some((name) => MUTATING.test(name)), `mutating tool ran: ${seen}`);
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'degraded');
+  assert.doesNotMatch(result.decision.reason, /single action complete/);
+  assert.ok(result.degraded.some((reason) => /no tool result addressed the task/.test(reason)));
+});
+
+test('RT-07: a result that echoes the task content counts as an answer', async () => {
+  const result = await agentWith(async () => envelope('It is 21:30 in Jakarta.'), ['watch_file']).run({ task: TIME_TASK, maxIterations: 3, maxToolCalls: 3 });
+  assert.equal(result.status, 'ok');
+  assert.equal(result.toolCalls, 1);
 });

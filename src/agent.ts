@@ -309,6 +309,18 @@ function isTransientReadFailure(toolName: string, error: string): boolean {
   return !MUTATING_TOOL.test(toolName) && TRANSIENT_ERROR.test(error);
 }
 
+/**
+ * Does a successful call plausibly answer an unplanned task? True when the tool's name speaks to
+ * the task (negated clauses like "do not modify any files" excluded) or its result repeats a distinctive word of the task.
+ */
+export function addressesTask(tool: AgentTool, task: string, resultText: string): boolean {
+  const subject = task.replace(NEGATED_WRITE, ' ');
+  const query = new Set(expandQuery(tokenize(subject)));
+  if (tokenize(tool.name.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
+  const result = resultText.toLowerCase();
+  return tokenize(subject).some((token) => token.length >= 4 && result.includes(token));
+}
+
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
   if (!forbidsWrites(task)) return tools;
   const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
@@ -993,6 +1005,8 @@ export class NativeNeedleAgent {
     let succeeded = 0;
     let failedCount = 0;
     let lastCallOk: boolean | undefined;
+    let answered = false;
+    const unanswered = new Set<string>();
     const degradedReasons: string[] = [];
     const failedCalls = new Map<string, { error: string; retries: number; transient: boolean }>();
     const recordFailure = (key: string, toolName: string, error: string) => {
@@ -1019,7 +1033,8 @@ export class NativeNeedleAgent {
         shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST);
       }
       if (readOnly) shortlist = shortlist.filter((tool) => !MUTATING_TOOL.test(tool.name));
-      if (!shortlist.length) { decision = readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
+      if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.name === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
 
@@ -1100,11 +1115,16 @@ export class NativeNeedleAgent {
         succeeded++;
         for (const reason of outcome.degraded) if (!degradedReasons.includes(reason)) degradedReasons.push(reason);
         if (!planned.length) {
-          // Without a deterministic plan there is no completion predicate;
-          // stop after the first successful action instead of repeating it
-          // until the iteration cap.
-          decision = `single action complete (${chosen.name})`;
-          break;
+          // Without a deterministic plan the completion predicate is "the result addresses the
+          // task": a non-failing call to an unrelated tool (runtime#4: watch_file for a time
+          // question) is not an answer, so try other tools until the budget runs out.
+          if (addressesTask(chosen, task, asText(result))) {
+            answered = true;
+            decision = `single action complete (${chosen.name})`;
+            break;
+          }
+          unanswered.add(chosen.name);
+          notes.push(`${chosen.name} succeeded but its result does not address the task`);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1133,6 +1153,7 @@ export class NativeNeedleAgent {
     const failed = succeeded === 0 || lastCallOk === false || decision.startsWith('repeated failing call');
     // A plan cut short (tool budget, time, no permitted tool) is partial, never a full success.
     const pendingSteps = planned.filter((step) => !completed(step, history)).map((step) => step.intent);
+    if (!failed && !planned.length && !answered) degradedReasons.push('no tool result addressed the task');
     if (!failed && pendingSteps.length) degradedReasons.push(`pending steps not run: ${pendingSteps.join(', ')}`);
     const status = failed ? 'failed' : failedCount > 0 || degradedReasons.length ? 'degraded' : 'ok';
     return {
