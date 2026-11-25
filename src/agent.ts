@@ -286,7 +286,14 @@ export function scoreTools(tools: AgentTool[], task: string, queryExtra = ''): A
 }
 
 // "Do not modify any files", "never write", "without changing": the task forbids writes.
-const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n]{0,40}?\b(?:modif\w*|chang\w*|edit\w*|writ\w*|creat\w*|delet\w*|remov\w*|alter\w*|overwrit\w*|touch\w*|mutat\w*|sav\w*)/i;
+const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n]{0,40}?\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*((?:[^.!?\n,;]|\.(?=\w)){0,60})/gi;
+// "without modifying the original", "do not change /tmp/a.txt": the ban names one protected target.
+const PROTECTED_TARGET = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input)\b|[\w-]+\.[a-z0-9]{1,5}\b|\/[\w.-]+/i;
+
+/** True when the task bans writes outright; a ban scoped to a named target leaves other writes allowed. */
+export function forbidsWrites(task: string): boolean {
+  return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_TARGET.test(match[1] ?? ''));
+}
 const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|insert|update|rename|truncate|import|archive|upload|drop)(_|$)/i;
 
 /**
@@ -295,7 +302,7 @@ const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|ins
  * them rather than return an empty list.
  */
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
-  if (!NEGATED_WRITE.test(task)) return tools;
+  if (!forbidsWrites(task)) return tools;
   const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
   return safe.length ? safe : tools;
 }
@@ -434,6 +441,7 @@ function intentForTool(name: string): string {
   if (name === 'list_directory' || name === 'terminal_ls') return 'list';
   if (name === 'read_file' || name === 'terminal_cat') return 'read';
   if (name === 'write_file') return 'write';
+  if (name === 'copy_file') return 'copy';
   if (name === 'find_files') return 'find';
   if (name === 'browser_navigate') return 'navigate';
   if (name === 'browser_type') return 'type';
@@ -490,7 +498,12 @@ function planFor(task: string): PlannedStep[] {
     return steps;
   }
 
-  const write = !browser && !NEGATED_WRITE.test(task) && hasAny(lower, /\b(write|create|save|make|append|edit)\b/) && (extractFilename(task) !== undefined || hasAny(lower, /\b(file|note|notes|document)\b/));
+  if (!browser && !forbidsWrites(task) && hasAny(lower, /\b(copy|duplicate)\b/) && (extractFilename(task) !== undefined || hasAny(lower, /\b(file|files)\b/))) {
+    steps.push({ intent: 'copy', tool: 'copy_file', description: 'copy the requested file' });
+    return steps;
+  }
+
+  const write = !browser && !forbidsWrites(task) && hasAny(lower, /\b(write|create|save|make|append|edit)\b/) && (extractFilename(task) !== undefined || hasAny(lower, /\b(file|note|notes|document)\b/));
   if (write) {
     steps.push({ intent: 'write', tool: 'write_file', description: 'write the requested file' });
     return steps;
@@ -962,7 +975,7 @@ export class NativeNeedleAgent {
     if (!health.ok) return { ok: false, error: health.detail, health };
 
     const planned = planFor(task);
-    const readOnly = NEGATED_WRITE.test(task);
+    const readOnly = forbidsWrites(task);
     const history: HistoryStep[] = [];
     const notes: string[] = [];
     const retrievedNames = new Set<string>();
