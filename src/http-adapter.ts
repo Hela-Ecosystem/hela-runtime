@@ -7,6 +7,8 @@ export interface HttpAdapterOptions {
   port?: number;
   host?: string;
   serverFactory?: () => Server;
+  /** Serve MCP only at this exact path (a capability URL); `/` and `/mcp` are then refused. */
+  secretPath?: string;
 }
 
 export class HttpAdapter {
@@ -19,10 +21,14 @@ export class HttpAdapter {
     this.options = {
       port: options.port ?? 8080,
       host: options.host ?? '0.0.0.0',
+      secretPath: options.secretPath,
     };
   }
 
   async start(): Promise<void> {
+    const mcpPath = (pathname: string): boolean => this.options.secretPath
+      ? pathname === this.options.secretPath
+      : pathname === '/' || pathname === '/mcp';
     this.httpServer = http.createServer(async (req, res) => {
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       if (req.method === 'GET' && url.pathname === '/healthz') {
@@ -30,14 +36,14 @@ export class HttpAdapter {
         res.end(JSON.stringify({ status: 'ok', transport: 'http', version: VERSION }));
         return;
       }
-      if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/mcp')) {
+      if (req.method === 'POST' && mcpPath(url.pathname)) {
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         const server = this.serverFactory();
         await server.connect(transport);
         await transport.handleRequest(req, res);
         return;
       }
-      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/mcp')) {
+      if (req.method === 'GET' && mcpPath(url.pathname)) {
         res.writeHead(405, { 'Content-Type': 'text/plain' });
         res.end('Method Not Allowed');
         return;
@@ -54,6 +60,12 @@ export class HttpAdapter {
         resolve();
       });
     });
+  }
+
+  /** The port actually bound (useful when started with port 0). */
+  get boundPort(): number {
+    const address = this.httpServer?.address();
+    return typeof address === 'object' && address ? address.port : this.options.port!;
   }
 
   async close(): Promise<void> {
