@@ -1,3 +1,18 @@
+## [1.4.4] - 2026-11-25
+
+### Fixed
+- `hela.agent.run` no longer ends a run as "single action complete" after one non-failing call to a tool that does not address the task. A call counts as answering when the tool name overlaps the task wording (ignoring "do not …" clauses) or its result repeats a distinctive task word; otherwise the run keeps trying other tools and ends `degraded` if none answers. The `hela-runtime#4` repro ("current time in Asia/Jakarta, do not modify any files") no longer finishes `ok:true` on `watch_file` (RT-07).
+- A write ban scoped to the task's own input ("without modifying the original") no longer drops a permitted action: that task now plans `copy_file`. A ban naming a concrete file or path stays a full ban (RT-03).
+- A read-only tool that fails with a timeout-like error gets one bounded retry; permanent errors and mutating tools are never retried (RT-04).
+- A plan cut short by `maxToolCalls` reports `status: "degraded"` with a `pendingSteps` list instead of `ok` (RT-05), and early exits (missing task, empty catalog, engine unavailable, planner throw) return `status: "failed"` (RT-06).
+
+### Known limits
+- RT-07 is a heuristic; a tool with neither name overlap nor task words in its result ends `degraded`, not `ok`.
+- `write_file` arguments embed a timestamp, so the duplicate-call key differs each attempt and a failing write is retried up to the iteration cap.
+
+### Tests
+- `tests/agent-rt-fixes.test.mjs`: one regression per row plus the concrete-path ban. Suite 86/86.
+
 ## [1.4.3] - 2026-11-25
 
 ### Fixed
