@@ -1,3 +1,14 @@
+## [1.4.2] - 2026-11-25
+
+### Fixed
+- `hela.agent.run` no longer reports a clean success when the tool it called returned `success: false`, `ok: false` or `isError: true`. Failed payloads and thrown errors are recorded as failed in `history`, an identical failing call is skipped instead of retried verbatim, and the result carries `ok`, `status`, `failedCalls`, `degraded` and `decision.action: "failed"` (hela-runtime#4).
+- A task that forbids modification is enforced on the final tool selection, not only on retrieval: the deterministic plan no longer treats the word "edit" inside "Do not edit any files" as a write request, and the run loop filters mutating tools after the shortlist is built. If no permitted tool remains, the run stops with `no permitted tools` instead of writing (hela-runtime#5, RT-01).
+- `classifyToolResult` now honours `isError` on results that carry `structuredContent` but no `content` array, and reads failure/degradation from `structuredContent` before the text summary. `hela.pipe` is fail-closed again for that shape (hela-runtime#5, RT-02).
+- The failure classifier is shared by `hela.pipe` and the native agent, so both paths agree on what a failed or degraded call is (hela-mcp-ecosystem#8).
+
+### Tests
+- Five regressions cover the read-only plan, the stubbed-write override, structured `isError`, structured degradation and the ordinary write plan; the full suite is 74/74.
+
 ## [1.4.1] - 2026-11-22
 
 ### Added
