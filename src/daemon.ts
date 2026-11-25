@@ -22,6 +22,7 @@ import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 import { ManifestStore } from './manifest.js';
 import { NativeNeedleAgent, scoreTools, type AgentContext, type AgentTool } from './agent.js';
 import { VERSION } from './version.js';
+import { classifyToolResult, degradationReasons } from './outcome.js';
 import {
   loadProfileContext,
   PROFILE_PROMPT_NAME,
@@ -559,53 +560,11 @@ export class HelaRuntime {
    * be visible in the shape, not only in prose (hela-mcp-ecosystem#8).
    */
   private static degradationReasons(structured: unknown): string[] {
-    if (structured === null || typeof structured !== 'object') return [];
-    const record = structured as Record<string, unknown>;
-    const reasons: string[] = [];
-    for (const key of ['degraded', 'partial', 'truncated'] as const) {
-      if (record[key] === true) reasons.push(key);
-      const detail = record[key];
-      if (detail && typeof detail === 'object' && typeof (detail as { reason?: unknown }).reason === 'string') {
-        reasons.push(String((detail as { reason: string }).reason));
-      }
-    }
-    if (record.status === 'degraded') reasons.push('status=degraded');
-    if (Array.isArray(record.warnings)) {
-      for (const warning of record.warnings) {
-        if (typeof warning === 'string' && warning.trim()) reasons.push(warning.trim());
-      }
-    }
-    return [...new Set(reasons)];
+    return degradationReasons(structured);
   }
 
   private pipeStepOutcome(res: unknown): { ok: boolean; payload: unknown; error?: string; degraded: string[] } {
-    const envelope = res as { content?: Array<{ type?: string; text?: string }>; isError?: boolean } | undefined;
-    const text = (envelope?.content ?? [])
-      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-      .map((part) => part.text as string)
-      .join('\n');
-
-    let structured: unknown;
-    try {
-      structured = JSON.parse(text);
-    } catch {
-      structured = undefined;
-    }
-
-    const failed = envelope?.isError === true
-      || (structured !== null && typeof structured === 'object'
-        && ((structured as Record<string, unknown>).success === false || (structured as Record<string, unknown>).ok === false));
-    if (!failed) {
-      return {
-        ok: true,
-        payload: structured !== undefined ? structured : text,
-        degraded: HelaRuntime.degradationReasons(structured),
-      };
-    }
-
-    const record = (structured ?? {}) as Record<string, unknown>;
-    const reason = record.error ?? record.message ?? text.slice(0, 300) ?? 'step failed';
-    return { ok: false, payload: structured !== undefined ? structured : text, error: String(reason), degraded: [] };
+    return classifyToolResult(res);
   }
 
   private async runPipe(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
