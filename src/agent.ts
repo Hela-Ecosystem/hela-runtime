@@ -287,20 +287,17 @@ export function scoreTools(tools: AgentTool[], task: string, queryExtra = ''): A
 
 // "Do not modify any files", "never write", "without changing": the task forbids writes.
 const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n]{0,40}?\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*((?:[^.!?\n,;]|\.(?=\w)){0,60})/gi;
-// "without modifying the original", "do not change /tmp/a.txt": the ban names one protected target.
-const PROTECTED_TARGET = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input)\b|[\w-]+\.[a-z0-9]{1,5}\b|\/[\w.-]+/i;
+// "without modifying the original": the ban protects the task's own input, so producing a new output stays allowed.
+// A ban naming a concrete file or path ("do not change /tmp/a.txt") stays a full ban: the runtime cannot yet tell
+// whether a chosen write would land on that file, so every mutating tool is withheld.
+const PROTECTED_INPUT = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input)\b/i;
 
-/** True when the task bans writes outright; a ban scoped to a named target leaves other writes allowed. */
+/** True when the task bans writes outright; only a ban scoped to the task's own input leaves other writes allowed. */
 export function forbidsWrites(task: string): boolean {
-  return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_TARGET.test(match[1] ?? ''));
+  return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
 }
 const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|insert|update|rename|truncate|import|archive|upload|drop)(_|$)/i;
 
-/**
- * When the task forbids modification, keep mutating tools out of the shortlist (retrieval
- * ranked write_file first for "Do not modify any files"). If nothing else is left, keep
- * them rather than return an empty list.
- */
 const MAX_TRANSIENT_RETRIES = 1;
 const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
 
@@ -321,6 +318,11 @@ export function addressesTask(tool: AgentTool, task: string, resultText: string)
   return tokenize(subject).some((token) => token.length >= 4 && result.includes(token));
 }
 
+/**
+ * When the task forbids modification, keep mutating tools out of the shortlist (retrieval
+ * ranked write_file first for "Do not modify any files"). If nothing else is left, keep
+ * them rather than return an empty list.
+ */
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
   if (!forbidsWrites(task)) return tools;
   const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));

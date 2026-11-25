@@ -56,6 +56,12 @@ test('RT-03: a task-wide write ban still blocks mutating tools', async () => {
   }
 });
 
+test('RT-03: a ban naming a concrete file or path stays a full ban', () => {
+  for (const task of ['Summarise notes. Do not modify a.txt', 'Read /etc/hosts and do not change /tmp/a.txt', 'Show config.json without editing config.json']) {
+    assert.ok(!avoidMutatingTools(catalog, task).some((entry) => entry.name === 'copy_file' || entry.name === 'write_file'), task);
+  }
+});
+
 test('RT-04: a transient read timeout gets one bounded retry, a permanent error none', async () => {
   const task = 'Read notes.txt';
   let calls = 0;
