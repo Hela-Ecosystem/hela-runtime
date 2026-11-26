@@ -394,7 +394,7 @@ const MUTATIONS: Mutation[] = [
   { verbs: ['upload', 'push'], request: /\b(upload|push|send|transfer|attach)\b/i, forbidding: /\b(?:upload\w*|push\w*|send\w*)\b/i },
 ];
 
-/** Tools that run whatever they are handed, so a ban on writing or deleting reaches them too. */
+/** Tools that run whatever they are handed, so a ban on any change they could make reaches them too. */
 const RUNS_ANYTHING = /^(?:execute_command|execute_sql|execute_blender_code|shell_exec|session_spawn|session_write|agent_spawn)$/;
 
 /** Actions that are not visible in a tool's verbs: the wording that bans them, and the tools that perform them. */
@@ -608,7 +608,7 @@ function taskGate(task: string) {
   const bans = bannedText(task);
   const isBanned = (toolName: string) => mutationsOf(toolName).some((mutation) => mutation.forbidding.test(bans))
     || INTERACTIONS.some((action) => action.tools.test(toolName) && action.forbidding.test(bans))
-    || (RUNS_ANYTHING.test(toolName) && [WRITE_ACTION, DELETE_ACTION].some((mutation) => mutation.forbidding.test(bans)));
+    || (RUNS_ANYTHING.test(toolName) && [...MUTATIONS, EXTRACT_ACTION].some((mutation) => mutation.forbidding.test(bans)));
   return {
     restricted,
     /** Without args: may the tool be planned or offered. With args: may this call be dispatched. */

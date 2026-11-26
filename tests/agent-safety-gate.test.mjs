@@ -190,6 +190,22 @@ for (const flavour of FLAVOURS) {
     }
   });
 
+  test(`gate (${flavour}): a ban on any change closes the shell; a page-action ban does not`, async () => {
+    const tools = catalogOf(flavour, [['execute_command', 'Run a shell command to check disk usage and fix the build.', { command: text }, ['command']]]);
+    const args = { execute_command: { command: 'make fix' } };
+    for (const ban of ['install anything', 'stop the server', 'move files', 'copy anything', 'upload anything', 'import data', 'archive logs', 'extract anything', 'delete anything', 'run anything']) {
+      for (const task of [`Fix the build. Do not ${ban}.`, `Check disk usage. Do not ${ban}.`]) {
+        const { ran, offered, plan } = await run(tools, task, 'execute_command', args);
+        assert.deepEqual([ran, offered, plan], [[], [], []], task);
+      }
+    }
+    for (const ban of ['click anything', 'type anything', 'navigate anywhere', 'take a screenshot']) {
+      for (const task of [`Fix the build. Do not ${ban}.`, `Check disk usage. Do not ${ban}.`]) {
+        assert.equal((await run(tools, task, 'execute_command', args)).ran[0], 'execute_command', task);
+      }
+    }
+  });
+
   test(`gate (${flavour}): long verb lists in a ban stay fast`, () => {
     for (const task of [`do not ${'modify '.repeat(20000)}`, `without modifying ${' ,'.repeat(40000)}x`]) {
       const started = Date.now();
