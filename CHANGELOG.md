@@ -1,7 +1,7 @@
 ## [1.4.5] - 2026-11-27
 
 ### Security
-- One permission gate now covers retrieval, planning and dispatch in `hela.agent.run`. A task that bans writes, or only asks to find something out, is restricted to read-only tools: a tool is accepted through a published `readOnlyHint: true` or the explicit allow-list, and in either case only with no veto (`destructiveHint: true`, `readOnlyHint: false`, malformed annotations, a change verb in the tool name, or an action the task bans). Everything else is refused, apart from the pinned shell diagnostic described under Behaviour changes. A banned action ("do not click") is refused on every task. Before this release, with canonical tool names, "Inspect the repository configuration. Do not modify any files." could run a model-written shell command, and "Do not click Delete" could still click it.
+- One permission gate now covers retrieval, planning and dispatch in `hela.agent.run`. A task that bans writes, or only asks to find something out, is restricted to read-only tools: a tool is accepted through a published `readOnlyHint: true` or the explicit allow-list, and in either case only with no veto (`destructiveHint: true`, `readOnlyHint: false`, malformed annotations, a change verb in the tool name, an action the task bans, or arguments that give it effects, such as a non-HTTP URL or page JavaScript in `browser_assert`). Everything else is refused, apart from the pinned shell diagnostic described under Behaviour changes. A banned action ("do not click") is refused on every task. Before this release, with canonical tool names, "Inspect the repository configuration. Do not modify any files." could run a model-written shell command, and "Do not click Delete" could still click it.
 - Paths, URLs and bare filenames are treated as data, not intent, so `/tmp/opencode/...` or `delete.md` no longer pull destructive tools into the shortlist (#9).
 
 ### Fixed
@@ -11,7 +11,7 @@
 - `hela.catalog.search` and `hela.catalog.list` match the cell name as well as the tool name. Queries are searched as written, with no path stripping and no task-intent boosts; words are still split, filtered for stop words, singularised and widened with synonyms.
 
 ### Behaviour changes
-- Any ban on writing or deleting, or on running commands, closes the shell: "Check disk usage. Do not modify any files." now fails. Unrelated bans such as "do not click" do not close it. With no such ban, a read-only task may run only the runtime's own pinned diagnostic, with model arguments stripped.
+- A ban on any change a shell could make (writing, deleting, moving, copying, stopping, installing, uninstalling, importing, archiving, extracting, uploading or sending), or on running commands, closes the shell: "Check disk usage. Do not modify any files." now fails. Page-action bans such as "do not click" do not close it. With no such ban, a read-only task may run only the runtime's own pinned diagnostic, with model arguments stripped.
 - "Check that npm test passes" counts as a lookup and no longer runs the tests.
 - Memory lookups no longer plan `memory_edit`.
 - Cell tool annotations are passed through to the agent catalog.
