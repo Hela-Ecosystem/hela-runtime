@@ -190,6 +190,7 @@ const clock = [
   namespaced('membrane', 'read_file', 'Read a file from disk.', { path: text }),
   namespaced('mitosis', 'convert_time', 'Convert time between timezones', { source_timezone: text, time: text, target_timezone: text }, ['source_timezone', 'time', 'target_timezone']),
   namespaced('mitosis', 'get_current_time', 'Get current time in a specific timezone', { timezone: text }, ['timezone']),
+  namespaced('receptor', 'app_current', 'Get the app currently in the foreground.', {}),
 ];
 const CLOCK_ARGS = {
   get_current_time: { timezone: 'Asia/Jakarta' },
