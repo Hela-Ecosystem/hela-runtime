@@ -177,10 +177,15 @@ for (const flavour of FLAVOURS) {
       ['Copy the settings file without modifying the original, or clicking', ['browser_click']],
       ['Copy the settings file. Do not modify the original or write anything', ['write_file', 'execute_command']],
     ]) {
+      assert.deepEqual((await run(mixed, task, 'copy_file')).plan.filter((name) => refused.includes(name)), [], task);
       assert.ok(offered(task).includes('copy_file'), task);
       assert.deepEqual(offered(task).filter((name) => refused.includes(name)), [], task);
     }
-    for (const task of ['Copy the settings file without modifying the original', 'Copy the settings file without changing the source data']) {
+    for (const task of [
+      'Copy the settings file without modifying the original', 'Copy the settings file without changing the source data',
+      'Copy the settings file. Do not modify the original or the copy', 'Copy the settings file without changing the source, or its backup copy',
+    ]) {
+      assert.deepEqual((await run(mixed, task, 'copy_file')).plan, ['copy_file'], task);
       assert.deepEqual(offered(task).sort(), ['browser_click', 'copy_file', 'delete_file', 'execute_command', 'write_file'], task);
     }
   });

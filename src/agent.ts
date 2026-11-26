@@ -495,9 +495,10 @@ function affirmativeText(text: string): string {
   return splitNegations(text).affirmative;
 }
 
-// A list of write verbs and, captured, the task's own input as its object: "changing or deleting the source file".
+// A list of write verbs and, captured, the task's own input as its object ("changing or deleting the source file"),
+// with any further determined objects ("the original or the copy"): those are things protected, not further bans.
 // The object is optional so that a long verb list is consumed in one match rather than retried from every verb.
-const PROTECTED_PHRASE = /\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*(?:[\s,]+(?:(?:or|and|nor)[\s,]+)?(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*)*(\s+(?:(?:the|its|their)\s+)?(?:original|source|input)\b(?:\s+(?:source|input|files?|data|documents?|images?)\b)*)?/gi;
+const PROTECTED_PHRASE = /\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*(?:[\s,]+(?:(?:or|and|nor)[\s,]+)?(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*)*(\s+(?:(?:the|its|their)\s+)?(?:original|source|input)\b(?:\s+(?:source|input|files?|data|documents?|images?)\b)*(?:\s*(?:,\s*)?(?:or|and|nor)\s+(?:the|its|their)\s+\w+(?:\s+(?:copy|copies|files?|data|documents?|images?)\b)*)*)?/gi;
 
 /**
  * The wording of every banned action. Protecting the task's own input bans nothing by itself, so that phrase is cut
