@@ -694,7 +694,7 @@ export class HelaRuntime {
     const cell = typeof args.cell === 'string' ? args.cell.trim() : '';
     const query = typeof args.query === 'string' ? args.query.trim() : '';
     let tools = cell ? catalog.filter((tool) => tool.cell === cell || tool.cell === `hela-${cell}`) : catalog;
-    if (query) tools = scoreTools(tools, query).map((entry) => entry.tool);
+    if (query) tools = scoreTools(tools, query, { catalog: true }).map((entry) => entry.tool);
     const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.min(300, Math.floor(Number(args.limit)))) : undefined;
     const cells = [...new Set(catalog.map((tool) => tool.cell))];
     return {
@@ -714,7 +714,7 @@ export class HelaRuntime {
     const query = String(args.query ?? '').trim();
     if (!query) return { ok: false, error: 'query is required' };
     const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.min(50, Math.floor(Number(args.limit)))) : 10;
-    const ranked = scoreTools(this.agentCatalog(), query).slice(0, limit);
+    const ranked = scoreTools(this.agentCatalog(), query, { catalog: true }).slice(0, limit);
     return {
       ok: true,
       query,

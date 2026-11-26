@@ -276,9 +276,9 @@ interface ScoredDoc {
   nameTokens: Set<string>;
 }
 
-function buildDocs(tools: AgentTool[]): ScoredDoc[] {
+function buildDocs(tools: AgentTool[], withCell: boolean): ScoredDoc[] {
   return tools.map((tool) => {
-    const name = tool.realName.replace(/_/g, ' ');
+    const name = `${withCell ? `${tool.cell} ` : ''}${tool.realName}`.replace(/_/g, ' ');
     const text = `${name} ${name} ${tool.description ?? ''} ${JSON.stringify(tool.inputSchema?.properties ?? {})}`;
     const tf = new Map<string, number>();
     for (const token of tokenize(text)) tf.set(token, (tf.get(token) ?? 0) + 1);
@@ -291,14 +291,15 @@ function buildDocs(tools: AgentTool[]): ScoredDoc[] {
   });
 }
 
-function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ tool: AgentTool; score: number }> {
-  const raw = [...new Set(tokenize(withoutPaths(`${task} ${queryExtra}`)))];
+/** `words` are matched against the documents; `phrasing` is what the intent patterns read. */
+function scoreDocs(docs: ScoredDoc[], words: string, phrasing: string): Array<{ tool: AgentTool; score: number }> {
+  const raw = [...new Set(tokenize(words))];
   if (!raw.length) return [];
   const query = expandQuery(raw);
   const df = new Map<string, number>();
   for (const doc of docs) for (const token of doc.tf.keys()) df.set(token, (df.get(token) ?? 0) + 1);
   const average = docs.reduce((sum, doc) => sum + doc.length, 0) / Math.max(1, docs.length);
-  const lowerTask = maskPaths(task).toLowerCase();
+  const lower = phrasing.toLowerCase();
 
   const scored = docs.map((doc) => {
     let score = 0;
@@ -310,7 +311,7 @@ function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ to
       if (doc.nameTokens.has(token)) score += idf * 1.8;
     }
     for (const rule of INTENT_BOOSTS) {
-      if (rule.pattern.test(lowerTask) && rule.names.includes(doc.tool.realName)) score += rule.boost;
+      if (rule.pattern.test(lower) && rule.names.includes(doc.tool.realName)) score += rule.boost;
     }
     return { tool: doc.tool, score };
   });
@@ -318,8 +319,13 @@ function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ to
   return scored.filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score);
 }
 
-export function scoreTools(tools: AgentTool[], task: string, queryExtra = ''): Array<{ tool: AgentTool; score: number }> {
-  return scoreDocs(buildDocs(tools), task, queryExtra);
+/**
+ * Ranks tools for a query. A catalog search is someone looking a tool up: the cell name counts and the query is taken
+ * literally. Otherwise the text is a task, where a cell name or a path must not select tools.
+ */
+export function scoreTools(tools: AgentTool[], query: string, options: { catalog?: boolean; context?: string } = {}): Array<{ tool: AgentTool; score: number }> {
+  if (options.catalog) return scoreDocs(buildDocs(tools, true), query, query);
+  return scoreDocs(buildDocs(tools, false), withoutPaths(`${query} ${options.context ?? ''}`), maskPaths(query));
 }
 
 // "Do not modify any files", "never write", "without changing": the task forbids writes.
@@ -658,7 +664,7 @@ export function retrieveTools(tools: AgentTool[], task: string, history: History
   const last = [...history].reverse().find((step) => step.ok && step.result);
   const lastName = tools.find((tool) => tool.name === last?.tool)?.realName ?? last?.tool;
   const queryExtra = last ? `${lastName} ${last.result?.slice(0, 500) ?? ''}` : '';
-  const ranked = scoreTools(tools, task, queryExtra).map((entry) => entry.tool);
+  const ranked = scoreTools(tools, task, { context: queryExtra }).map((entry) => entry.tool);
   return avoidMutatingTools(ranked, task).filter((tool) => gate.permits(tool)).slice(0, limit);
 }
 
