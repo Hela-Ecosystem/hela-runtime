@@ -33,12 +33,18 @@ const TASK = 'Tell me the current time in Asia/Jakarta. Do not modify any files.
 // opening with a name match (RT-08).
 const clockNow = (entry) => ({ ...tool('clock_now', entry.description), annotations: { readOnlyHint: true } });
 const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? clockNow(entry) : entry));
+const FLAVOURS = [
+  ['bare', (tools) => tools],
+  ['namespaced', (tools) => tools.map((entry) => ({ ...entry, name: `hela_fixture_${entry.realName}` }))],
+];
+// Needle picks by exposed name; the tests name tools as their cell does.
+const exposedPick = (tools, pick) => tools.find((entry) => entry.realName === pick)?.name ?? pick;
 function agentWith(executeAgentTool, picks, tools = catalog) {
   const host = { agentCatalog: () => tools, agentContext: () => ({ workspaceRoot: '/tmp/ws', cwd: '/tmp/cwd' }), executeAgentTool };
   const agent = new NativeNeedleAgent(host, { root: assetRoot, profile: null });
   const queue = [...picks];
-  agent.choose = async () => (queue.length > 1 ? queue.shift() : queue[0]);
-  agent.arguments = async (selected) => ({ args: selected.name === 'get_current_time' ? { timezone: 'Asia/Jakarta' } : { path: '/data/some-directory' } });
+  agent.choose = async () => exposedPick(tools, queue.length > 1 ? queue.shift() : queue[0]);
+  agent.arguments = async (selected) => ({ args: selected.realName === 'get_current_time' ? { timezone: 'Asia/Jakarta' } : { path: '/data/some-directory' } });
   return agent;
 }
 
@@ -77,32 +83,36 @@ test('classifyToolResult: structured degradation takes precedence over a text su
   assert.deepEqual(outcome.degraded, ['partial', 'truncated', 'missing rows']);
 });
 
-test('agent_run: a read with a task-wide edit prohibition executes only read_file', async () => {
-  const seen = [];
-  const agent = agentWith(async (selected) => {
-    seen.push(selected.name);
-    return envelope('notes');
-  }, ['write_file']);
-  const task = 'Read notes.txt. Do not edit any files.';
-  const result = await agent.run({ task });
-  assert.deepEqual(seen, ['read_file']);
-  assert.equal(result.ok, true);
-  assert.deepEqual(result.plan.map((step) => step.tool), ['read_file']);
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`agent_run: a read with a task-wide edit prohibition executes only read_file (${flavour})`, async () => {
+    const seen = [];
+    const agent = agentWith(async (selected) => {
+      seen.push(selected.realName);
+      return envelope('notes');
+    }, ['write_file'], shape(catalog));
+    const task = 'Read notes.txt. Do not edit any files.';
+    const result = await agent.run({ task });
+    assert.deepEqual(seen, ['read_file']);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.plan.map((step) => step.tool), ['read_file']);
+  });
+}
 
-test('agent_run: a stubbed write choice cannot override a task-wide prohibition', async () => {
-  const seen = [];
-  const onlyWrites = catalog.filter((entry) => entry.name === 'write_file');
-  const agent = agentWith(async (selected) => {
-    seen.push(selected.name);
-    return envelope({ ok: true });
-  }, ['write_file'], onlyWrites);
-  const result = await agent.run({ task: TASK });
-  assert.deepEqual(seen, []);
-  assert.equal(result.ok, false);
-  assert.equal(result.toolCalls, 0);
-  assert.match(result.decision.reason, /no (?:permitted|safe) tool/i);
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`agent_run: a stubbed write choice cannot override a task-wide prohibition (${flavour})`, async () => {
+    const seen = [];
+    const onlyWrites = shape(catalog.filter((entry) => entry.name === 'write_file'));
+    const agent = agentWith(async (selected) => {
+      seen.push(selected.realName);
+      return envelope({ ok: true });
+    }, ['write_file'], onlyWrites);
+    const result = await agent.run({ task: TASK });
+    assert.deepEqual(seen, []);
+    assert.equal(result.ok, false);
+    assert.equal(result.toolCalls, 0);
+    assert.match(result.decision.reason, /no (?:permitted|safe) tool/i);
+  });
+}
 
 test('agent_plan: an ordinary write still plans write_file', async () => {
   const agent = agentWith(async () => assert.fail('plan should never execute tools'), []);
@@ -164,23 +174,25 @@ test('agent_run: partial results are reported as degraded', async () => {
   assert.deepEqual(result.degraded, ['partial']);
 });
 
-test('retrieval keeps write tools out of the shortlist when the task forbids modification', () => {
-  const forbids = [
-    'Tell me the current time in Asia/Jakarta. Do not modify any files.',
-    "Read notes.txt, don't change anything",
-    'Summarise the repo and never overwrite existing files',
-    'List the directory without writing to disk',
-  ];
-  for (const task of forbids) {
-    const names = retrieveTools(catalog, task).map((t) => t.name);
-    assert.ok(!names.includes('write_file'), `write_file offered for: ${task}`);
-    assert.ok(names.length > 0);
-  }
-  // Ordinary tasks, and tasks that merely contain "no" or "save", keep every tool.
-  for (const task of ['Write hello to notes.txt', 'I have no idea how to save time on this', 'Create a file named a.txt']) {
-    assert.ok(retrieveTools(catalog, task, [], 10).map((t) => t.name).includes('write_file'), task);
-  }
-  // Never an empty shortlist: if only mutating tools exist they stay.
-  const onlyWrites = catalog.filter((t) => t.name === 'write_file');
-  assert.deepEqual(avoidMutatingTools(onlyWrites, 'Do not modify any files').map((t) => t.name), ['write_file']);
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`retrieval keeps write tools out of the shortlist when the task forbids modification (${flavour})`, () => {
+    const forbids = [
+      'Tell me the current time in Asia/Jakarta. Do not modify any files.',
+      "Read notes.txt, don't change anything",
+      'Summarise the repo and never overwrite existing files',
+      'List the directory without writing to disk',
+    ];
+    for (const task of forbids) {
+      const names = retrieveTools(shape(catalog), task).map((t) => t.realName);
+      assert.ok(!names.includes('write_file'), `write_file offered for: ${task}`);
+      assert.ok(names.length > 0);
+    }
+    // Ordinary tasks, and tasks that merely contain "no" or "save", keep every tool.
+    for (const task of ['Write hello to notes.txt', 'I have no idea how to save time on this', 'Create a file named a.txt']) {
+      assert.ok(retrieveTools(shape(catalog), task, [], 10).map((t) => t.realName).includes('write_file'), task);
+    }
+    // Never an empty shortlist: if only mutating tools exist they stay.
+    const onlyWrites = shape(catalog.filter((t) => t.name === 'write_file'));
+    assert.deepEqual(avoidMutatingTools(onlyWrites, 'Do not modify any files').map((t) => t.realName), ['write_file']);
+  });
+}
