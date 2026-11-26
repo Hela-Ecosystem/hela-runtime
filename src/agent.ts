@@ -239,8 +239,10 @@ const QUOTED_PATH_OR_WORD = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]+/g;
 function replacePaths(text: string, placeholder: (value: string) => string): string {
   return text.replace(QUOTED_PATH_OR_WORD, (match: string) => {
     if (!/[/\\]/.test(match)) return match;
-    const punctuation = match.match(/[.,;:!?]+$/)?.[0] ?? '';
-    return ` ${placeholder(match.slice(0, match.length - punctuation.length))}${punctuation}`;
+    // Scanned backwards: an anchored /[.,;:!?]+$/ is quadratic on long punctuation runs.
+    let end = match.length;
+    while (end > 0 && '.,;:!?'.includes(match[end - 1])) end--;
+    return ` ${placeholder(match.slice(0, end))}${match.slice(end)}`;
   });
 }
 
@@ -365,7 +367,32 @@ function isMutatingTool(toolName: string): boolean {
 }
 
 const NEGATED_CLAUSE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n,;]*/gi;
-const QUOTED_TEXT = /(^|\s)(["'`])[^\n]*?\2(?=$|[\s.,;:!?])/g;
+const OPENING_QUOTE = /(?<=^|\s)["'`]/g;
+const CLOSING_QUOTE = /["'`](?=$|[\s.,;:!?])/g;
+
+/**
+ * Drops quoted spans: from a quote starting a word to the next same quote ending one. Unclosed quotes stay.
+ * Closers are indexed once, so many unclosed quotes cannot make this rescan the line.
+ */
+function withoutQuoted(line: string): string {
+  const closers = new Map<string, { at: number[]; next: number }>();
+  for (const match of line.matchAll(CLOSING_QUOTE)) {
+    const entry = closers.get(match[0]) ?? { at: [], next: 0 };
+    entry.at.push(match.index);
+    closers.set(match[0], entry);
+  }
+  let kept = '';
+  let from = 0;
+  for (const match of line.matchAll(OPENING_QUOTE)) {
+    const entry = closers.get(match[0]);
+    if (!entry || match.index < from) continue;
+    while (entry.next < entry.at.length && entry.at[entry.next] <= match.index) entry.next++;
+    if (entry.next === entry.at.length) continue;
+    kept += `${line.slice(from, match.index)} `;
+    from = entry.at[entry.next] + 1;
+  }
+  return kept + line.slice(from);
+}
 
 /** The task's own wording of what it wants: paths and negated clauses removed. */
 function requestedText(task: string): string {
@@ -373,7 +400,7 @@ function requestedText(task: string): string {
 }
 
 function asksFor(task: string, mutations: Array<{ request: RegExp }>): boolean {
-  const requested = requestedText(task).replace(QUOTED_TEXT, ' ');
+  const requested = requestedText(task).split('\n').map(withoutQuoted).join('\n');
   return mutations.some((mutation) => mutation.request.test(requested));
 }
 

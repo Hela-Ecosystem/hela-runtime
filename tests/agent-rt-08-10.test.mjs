@@ -140,6 +140,20 @@ test('RT-10: a long slash-free word does not stall path matching', () => {
   assert.ok(Date.now() - started < 5000);
 });
 
+test('RT-10: unclosed quotes and punctuation runs do not stall the gate', () => {
+  for (const task of [`delete ${' "x'.repeat(60000)}`, `delete ${'.'.repeat(60000)}a/`]) {
+    const started = Date.now();
+    names(task);
+    assert.ok(Date.now() - started < 5000, task.slice(0, 20));
+  }
+});
+
+test('RT-10: an unclosed quote hides nothing, a closed one only its own span', () => {
+  assert.ok(names('Please "inspect, then delete the opencode session').includes('opencode_session_delete'));
+  assert.ok(names('Inspect "the notes" then delete the opencode session').includes('opencode_session_delete'));
+  assert.ok(!names("Inspect the opencode session named 'delete me'.").includes('opencode_session_delete'));
+});
+
 // hela-runtime#4: get_current_time is retrieved, yet Needle opens with watch_file.
 const clock = [
   namespaced('membrane', 'watch_file', 'Watch file or directory for changes.', { path: text }),
