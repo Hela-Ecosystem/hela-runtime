@@ -1,10 +1,12 @@
-## [1.4.5] - 2026-11-27
+## [1.4.5] - 2026-11-26
 
 ### Security
 - One permission gate now covers retrieval, planning and dispatch in `hela.agent.run`. A task that bans writes, or only asks to find something out, is restricted to read-only tools: a tool is accepted through a published `readOnlyHint: true` or the explicit allow-list, and in either case only with no veto (`destructiveHint: true`, `readOnlyHint: false`, malformed annotations, a change verb in the tool name, an action the task bans, or arguments that give it effects, such as a non-HTTP URL or page JavaScript in `browser_assert`). Everything else is refused, apart from the pinned shell diagnostic described under Behaviour changes. A banned action ("do not click") is refused on every task. Before this release, with canonical tool names, "Inspect the repository configuration. Do not modify any files." could run a model-written shell command, and "Do not click Delete" could still click it.
 - Paths, URLs and bare filenames are treated as data, not intent, so `/tmp/opencode/...` or `delete.md` no longer pull destructive tools into the shortlist (#9).
+- The gate is re-checked against the booted cell's tool annotations before each call; malformed annotations are refused.
 
 ### Fixed
+- A ban written beside "do not modify the original" now holds, commas glued to a path separate clauses, and plans use the same annotation-aware gate as execution.
 - Namespaced catalogs (the default) work: planning, intent matching, hints, boosts and argument repair use the cell tool name, execution uses the exposed name, and the model is shown cell tool names, so its picks no longer depend on the naming mode (#8).
 - A time question opens with the read-only tool that names it when the model's pick shares no word with the task (#4).
 - In runs without a deterministic plan, a lookup is no longer reported as having made the change a task asked for. Planned runs are not checked this way.
@@ -22,9 +24,11 @@
 - "Read X then delete it" can end `ok` after only the read.
 - Identical model picks do not guarantee an answer: some metadata tasks end `failed` with no call.
 - One inherited quadratic scan remains in retrieval for very long repetitive input.
+- "Do not modify the original or the copy" still exempts other writes (behaviour from 1.4.4).
+- `read_file` argument repair can turn `/tmp/report.txt` into a workspace-relative path (present before this release).
 
 ### Tests
-- Suite 288/288, safety cases run against both bare and namespaced catalogs. Model behaviour is stubbed in the suite; the issue repros were also run with the real Needle engine and record-only dispatch.
+- Suite 333/333, safety cases run against both bare and namespaced catalogs. Model behaviour is stubbed in the suite; the issue repros were also run with the real Needle engine and record-only dispatch.
 
 ## [1.4.4] - 2026-11-25
 
