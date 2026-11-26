@@ -178,7 +178,8 @@ test('RT-08: the preference never switches Needle to a mutating tool', async () 
   const tools = [namespaced('membrane', 'delete_file', 'Delete a file.', {}), namespaced('membrane', 'get_file_info', 'Get metadata.', {})];
   const seen = [];
   const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('delete file done'); }, () => 'hela_membrane_get_file_info');
-  await agent.run({ task: 'Delete the stale file', maxIterations: 1 });
+  const result = await agent.run({ task: 'Delete the stale file', maxIterations: 1 });
+  assert.deepEqual(result.notes.filter((note) => /matches the task better/.test(note)), []);
   assert.deepEqual(seen, ['get_file_info']);
 });
 
@@ -196,3 +197,14 @@ for (const choice of ['hela_ribosome_session_signal', undefined, 'done']) {
     if (choice === 'done') assert.deepEqual(seen, []);
   });
 }
+
+test('RT-08: a single shared word does not override Needle', async () => {
+  const tools = [
+    namespaced('enzyme', 'url_metadata_extractor', 'Extract metadata from a URL.', {}),
+    namespaced('membrane', 'read_file', 'Read a file and its metadata.', {}),
+  ];
+  const seen = [];
+  const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('metadata'); }, () => 'hela_membrane_read_file');
+  await agent.run({ task: 'Inspect metadata for /tmp/opencode/definitely-missing.md', maxIterations: 1 });
+  assert.deepEqual(seen, ['read_file']);
+});

@@ -401,12 +401,15 @@ function intentMatch(tool: AgentTool, task: string): { name: number; description
   return { name: count(tool.realName.replace(/_/g, ' ')), description: count(tool.description ?? '') };
 }
 
-/** The read-only tool whose name matches the task best; the description breaks ties, then retrieval order. */
+/**
+ * The read-only tool whose name matches the task best; the description breaks ties, then retrieval order. One shared
+ * word is coincidence ("metadata" of a file is not url_metadata_extractor), so the name must carry at least two.
+ */
 function bestIntentMatch(shortlist: AgentTool[], task: string): { tool: AgentTool; name: number } | undefined {
   return shortlist
     .filter((tool) => !isMutatingTool(tool.realName))
     .map((tool) => ({ tool, ...intentMatch(tool, task) }))
-    .filter((match) => match.name > 0)
+    .filter((match) => match.name > 1)
     .sort((a, b) => b.name - a.name || b.description - a.description)[0];
 }
 
