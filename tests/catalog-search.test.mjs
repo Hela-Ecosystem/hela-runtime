@@ -46,7 +46,7 @@ for (const namespaced of MODES) {
 
   test(`catalog search (${mode}): tool queries and filename or slash queries are matched literally`, () => {
     const host = runtime(namespaced);
-    assert.equal(search(host, 'read file')[0], 'hela-membrane:read_file');
+    assert.equal(search(host, 'read file disk')[0], 'hela-membrane:read_file');
     assert.equal(search(host, 'cytosol screenshot')[0], 'hela-cytosol:browser_screenshot');
     assert.equal(search(host, 'move/rename')[0], 'hela-membrane:move_file');
     assert.equal(search(host, 'package.json')[0], 'hela-receptor:app_list');
@@ -57,6 +57,17 @@ test('catalog search ranks identically in both naming modes', () => {
   for (const query of ['membrane', 'nucleus', 'read file', 'screenshot', 'execute command', 'browser']) {
     assert.deepEqual(search(runtime(true), query), search(runtime(false), query), query);
   }
+});
+
+test('catalog search applies no task-intent boost; task retrieval does', () => {
+  // "run" boosts execute_command for a task. A lookup ranks by the words alone.
+  const tools = [
+    { ...tool('execute_command', 'Execute a shell command.'), realName: 'execute_command', cell: 'hela-fixture' },
+    { ...tool('run_report', 'Run the report.'), realName: 'run_report', cell: 'hela-fixture' },
+  ];
+  const first = (options) => scoreTools(tools, 'run report', options)[0].tool.realName;
+  assert.equal(first({ catalog: true }), 'run_report');
+  assert.equal(first({}), 'execute_command');
 });
 
 test('task retrieval still ignores cell names', () => {

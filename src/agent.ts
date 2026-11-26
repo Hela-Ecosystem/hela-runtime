@@ -307,15 +307,15 @@ function buildDocs(tools: AgentTool[], withCell: boolean): ScoredDoc[] {
   });
 }
 
-/** `words` are matched against the documents; `phrasing` is what the intent patterns read. */
-function scoreDocs(docs: ScoredDoc[], words: string, phrasing: string): Array<{ tool: AgentTool; score: number }> {
+/** `words` are matched against the documents; `phrasing`, given for a task only, is what the intent boosts read. */
+function scoreDocs(docs: ScoredDoc[], words: string, phrasing?: string): Array<{ tool: AgentTool; score: number }> {
   const raw = [...new Set(tokenize(words))];
   if (!raw.length) return [];
   const query = expandQuery(raw);
   const df = new Map<string, number>();
   for (const doc of docs) for (const token of doc.tf.keys()) df.set(token, (df.get(token) ?? 0) + 1);
   const average = docs.reduce((sum, doc) => sum + doc.length, 0) / Math.max(1, docs.length);
-  const lower = phrasing.toLowerCase();
+  const lower = phrasing?.toLowerCase();
 
   const scored = docs.map((doc) => {
     let score = 0;
@@ -326,8 +326,10 @@ function scoreDocs(docs: ScoredDoc[], words: string, phrasing: string): Array<{ 
       score += idf * (frequency * 2.2) / (frequency + 1.2 * (0.25 + 0.75 * doc.length / Math.max(1, average)));
       if (doc.nameTokens.has(token)) score += idf * 1.8;
     }
-    for (const rule of INTENT_BOOSTS) {
-      if (rule.pattern.test(lower) && rule.names.includes(doc.tool.realName)) score += rule.boost;
+    if (lower !== undefined) {
+      for (const rule of INTENT_BOOSTS) {
+        if (rule.pattern.test(lower) && rule.names.includes(doc.tool.realName)) score += rule.boost;
+      }
     }
     return { tool: doc.tool, score };
   });
@@ -336,11 +338,12 @@ function scoreDocs(docs: ScoredDoc[], words: string, phrasing: string): Array<{ 
 }
 
 /**
- * Ranks tools for a query. A catalog search is someone looking a tool up: the cell name counts and the query is taken
- * literally. Otherwise the text is a task, where a cell name or a path must not select tools.
+ * Ranks tools for a query. A catalog search is someone looking a tool up: the cell name counts, paths are searched as
+ * written and no task-intent boost applies (words are still stemmed and widened by synonyms). Otherwise the text is a
+ * task, where a cell name or a path must not select tools and the intent boosts apply.
  */
 export function scoreTools(tools: AgentTool[], query: string, options: { catalog?: boolean; context?: string } = {}): Array<{ tool: AgentTool; score: number }> {
-  if (options.catalog) return scoreDocs(buildDocs(tools, true), query, query);
+  if (options.catalog) return scoreDocs(buildDocs(tools, true), query);
   return scoreDocs(buildDocs(tools, false), withoutPaths(`${query} ${options.context ?? ''}`), maskPaths(query));
 }
 
