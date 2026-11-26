@@ -383,6 +383,9 @@ const MUTATIONS: Mutation[] = [
   { verbs: ['upload', 'push'], request: /\b(upload|push|send|transfer|attach)\b/i, forbidding: /\b(?:upload\w*|push\w*|send\w*)\b/i },
 ];
 
+/** Tools that run whatever they are handed, so a ban on writing or deleting reaches them too. */
+const RUNS_ANYTHING = /^(?:execute_command|execute_sql|execute_blender_code|shell_exec|session_spawn|session_write|agent_spawn)$/;
+
 /** Actions that are not visible in a tool's verbs: the wording that bans them, and the tools that perform them. */
 const INTERACTIONS: Array<{ forbidding: RegExp; tools: RegExp }> = [
   {
@@ -399,7 +402,7 @@ const INTERACTIONS: Array<{ forbidding: RegExp; tools: RegExp }> = [
   },
   { forbidding: /\b(?:navigat\w*|visit\w*|brows(?:e|ing))\b/i, tools: /^browser_(?:navigate|search|new_tab|back|forward|reload)$/ },
   { forbidding: /\b(?:screenshot\w*|captur\w*)\b/i, tools: /^(?:browser_)?screenshot$/ },
-  { forbidding: /\b(?:run(?:ning)?|execut\w*)\b/i, tools: /^(?:execute_command|execute_sql|execute_blender_code|shell_exec|session_spawn|session_write|agent_spawn)$/ },
+  { forbidding: /\b(?:run(?:ning)?|execut\w*)\b/i, tools: RUNS_ANYTHING },
 ];
 
 function mutationsOf(toolName: string): Mutation[] {
@@ -481,10 +484,17 @@ function affirmativeText(text: string): string {
   return splitNegations(text).affirmative;
 }
 
-/** The wording of every banned action. A ban protecting only the task's own input bans no tool. */
+// A list of write verbs and, captured, the task's own input as its object: "changing or deleting the source file".
+// The object is optional so that a long verb list is consumed in one match rather than retried from every verb.
+const PROTECTED_PHRASE = /\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*(?:[\s,]+(?:(?:or|and|nor)[\s,]+)?(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*)*(\s+(?:(?:the|its|their)\s+)?(?:original|source|input)\b(?:\s+(?:source|input|files?|data|documents?|images?)\b)*)?/gi;
+
+/**
+ * The wording of every banned action. Protecting the task's own input bans nothing by itself, so that phrase is cut
+ * out; whatever else the same clause bans ("... or click anything") stays banned.
+ */
 function bannedText(task: string): string {
   return splitNegations(replacePaths(task, () => ' ')).negated
-    .filter((span) => !span.match(NEGATED_WRITE) || forbidsWrites(span))
+    .map((span) => span.replace(PROTECTED_PHRASE, (phrase: string, input?: string) => (input ? ' ' : phrase)))
     .join('\n');
 }
 
@@ -585,7 +595,8 @@ function taskGate(task: string) {
   const diagnostic = fixed?.readOnly ? fixed.command : undefined;
   const bans = bannedText(task);
   const isBanned = (toolName: string) => mutationsOf(toolName).some((mutation) => mutation.forbidding.test(bans))
-    || INTERACTIONS.some((action) => action.tools.test(toolName) && action.forbidding.test(bans));
+    || INTERACTIONS.some((action) => action.tools.test(toolName) && action.forbidding.test(bans))
+    || (RUNS_ANYTHING.test(toolName) && [WRITE_ACTION, DELETE_ACTION].some((mutation) => mutation.forbidding.test(bans)));
   return {
     restricted,
     /** Without args: may the tool be planned or offered. With args: may this call be dispatched. */

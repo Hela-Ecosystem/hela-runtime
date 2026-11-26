@@ -157,6 +157,42 @@ for (const flavour of FLAVOURS) {
     }
   });
 
+  test(`gate (${flavour}): protecting the input exempts only that phrase, not the other bans beside it`, async () => {
+    const mixed = catalogOf(flavour, [
+      ['browser_navigate', 'Open a URL in the browser page.', { url: text }, ['url']],
+      ['browser_click', 'Click an element on the settings page.'],
+      ['copy_file', 'Copy a settings file.', { source: text }],
+      ['write_file', 'Write a settings file.', { path: text }],
+      ['delete_file', 'Delete a settings file.', { path: text }],
+      ['execute_command', 'Run a shell command on the settings.', { command: text }],
+    ]);
+    const offered = (task) => retrieveTools(mixed, task, [], 10).map((tool) => tool.realName);
+    const open = 'Open https://example.test/settings. Do not modify the original or click anything.';
+    const { ran, plan } = await run(mixed, open, 'browser_click', { browser_navigate: { url: 'https://example.test/settings' } });
+    assert.ok(!plan.includes('browser_click') && !ran.includes('browser_click'), `${plan} / ${ran}`);
+    assert.ok(!offered(open).includes('browser_click'));
+    for (const [task, refused] of [
+      ['Copy the settings file without modifying the original or deleting anything', ['delete_file', 'execute_command']],
+      ['Copy the settings file without modifying the original or running anything', ['execute_command']],
+      ['Copy the settings file without modifying the original, or clicking', ['browser_click']],
+      ['Copy the settings file. Do not modify the original or write anything', ['write_file', 'execute_command']],
+    ]) {
+      assert.ok(offered(task).includes('copy_file'), task);
+      assert.deepEqual(offered(task).filter((name) => refused.includes(name)), [], task);
+    }
+    for (const task of ['Copy the settings file without modifying the original', 'Copy the settings file without changing the source data']) {
+      assert.deepEqual(offered(task).sort(), ['browser_click', 'copy_file', 'delete_file', 'execute_command', 'write_file'], task);
+    }
+  });
+
+  test(`gate (${flavour}): long verb lists in a ban stay fast`, () => {
+    for (const task of [`do not ${'modify '.repeat(20000)}`, `without modifying ${' ,'.repeat(40000)}x`]) {
+      const started = Date.now();
+      retrieveTools(page, task);
+      assert.ok(Date.now() - started < 5000, task.slice(0, 30));
+    }
+  });
+
   test(`gate (${flavour}): a ban ends where the next request begins`, async () => {
     const planOf = async (task) => (await run(page, task, 'browser_navigate')).plan;
     assert.deepEqual(await planOf('Open https://example.test/a. Do not click Delete and take a screenshot'), ['browser_navigate', 'browser_screenshot']);
