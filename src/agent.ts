@@ -232,17 +232,20 @@ function expandQuery(tokens: string[]): string[] {
   return [...out];
 }
 
-// A quoted path (may contain spaces), else one word; words with a slash are paths or URLs: they name data, not
-// actions. Words are matched whole and filtered afterwards, which stays linear on long slash-free input.
+// A quoted path (may contain spaces), else one word; words with a slash are paths or URLs, and words ending in a
+// file extension are filenames: both name data, not actions ("delete.md" asks for no deletion). Words are matched
+// whole and filtered afterwards, which stays linear on long input.
+const BARE_FILENAME = /\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|ini|cfg|conf|env|lock|log|bak|tmp|csv|tsv|js|mjs|cjs|ts|tsx|jsx|py|sh|bash|zsh|c|cc|cpp|h|hpp|rs|go|java|kt|php|rb|sql|db|sqlite|css|scss|html?|xml|pdf|png|jpe?g|webp|gif|svg|zip|tar|gz|blend|apk)$/i;
 const QUOTED_PATH_OR_WORD = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]+/g;
 
 function replacePaths(text: string, placeholder: (value: string) => string): string {
   return text.replace(QUOTED_PATH_OR_WORD, (match: string) => {
-    if (!/[/\\]/.test(match)) return match;
     // Scanned backwards: an anchored /[.,;:!?]+$/ is quadratic on long punctuation runs.
     let end = match.length;
     while (end > 0 && '.,;:!?'.includes(match[end - 1])) end--;
-    return ` ${placeholder(match.slice(0, end))}${match.slice(end)}`;
+    const core = match.slice(0, end);
+    if (!/[/\\]/.test(core) && !BARE_FILENAME.test(core)) return match;
+    return ` ${placeholder(core)}${match.slice(end)}`;
   });
 }
 

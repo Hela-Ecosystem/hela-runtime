@@ -154,6 +154,23 @@ test('RT-10: an unclosed quote hides nothing, a closed one only its own span', (
   assert.ok(!names("Inspect the opencode session named 'delete me'.").includes('opencode_session_delete'));
 });
 
+const bare = (tools) => tools.map((tool) => ({ ...tool, name: tool.realName }));
+const FLAVOURS = [['bare', bare], ['namespaced', (tools) => tools]];
+
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-10 (${flavour}): a bare filename is data, not an action`, async () => {
+    const tools = shape(risky);
+    for (const task of ['Inspect metadata for delete.md.', 'Inspect metadata for remove.log and stop.json', 'Inspect metadata for "kill.sh"']) {
+      assert.deepEqual(writes(names(task, tools)), [], task);
+    }
+    const seen = [];
+    const choice = shape([mutating[0]])[0].name;
+    const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('delete.md metadata'); }, () => choice);
+    await agent.run({ task: 'Inspect metadata for delete.md.', maxIterations: 4, maxToolCalls: 4 });
+    assert.deepEqual(writes(seen), []);
+  });
+}
+
 // hela-runtime#4: get_current_time is retrieved, yet Needle opens with watch_file.
 const clock = [
   namespaced('membrane', 'watch_file', 'Watch file or directory for changes.', { path: text }),
