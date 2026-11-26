@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { classifyToolResult } from './outcome.js';
+import { validAnnotations } from './types.js';
 
 /**
  * Runtime-native Needle agent.
@@ -547,6 +548,8 @@ type GatedTool = Pick<AgentTool, 'realName' | 'annotations'>;
 
 /** A hint or a name that says "changes state" wins; otherwise a read-only hint or the allow-list is required. */
 function isReadOnlyTool(tool: GatedTool): boolean {
+  // Live tool lists are not validated on the way in: hints that cannot be read count as a refusal.
+  if (!validAnnotations(tool.annotations)) return false;
   const { readOnlyHint, destructiveHint } = tool.annotations ?? {};
   if (destructiveHint === true || readOnlyHint === false || isMutatingTool(tool.realName)) return false;
   return readOnlyHint === true || READ_ONLY_TOOLS.has(tool.realName);
@@ -582,6 +585,7 @@ function taskGate(task: string) {
     permits(tool: GatedTool, args?: Record<string, unknown>): boolean {
       if (isBanned(tool.realName)) return false;
       if (!restricted) return true;
+      if (!validAnnotations(tool.annotations)) return false;
       if (tool.realName === 'execute_command') {
         return diagnostic !== undefined && (!args
           || (args.command === diagnostic && Object.keys(args).every((key) => key === 'command' || key === 'workingDirectory')));

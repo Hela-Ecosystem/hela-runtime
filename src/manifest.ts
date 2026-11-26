@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import type { CellSpec } from './types.js';
+import { validAnnotations, type CellSpec } from './types.js';
 import { resolveDir } from './cell-loader.js';
 
 export interface ToolDefinition {
@@ -15,7 +15,8 @@ export function validTools(value: unknown): value is ToolDefinition[] {
   if (!Array.isArray(value)) return false;
   const names = new Set<string>();
   return value.every(tool => {
-    if (!tool || typeof tool.name !== 'string' || !tool.name || names.has(tool.name) || tool.inputSchema?.type !== 'object') return false;
+    if (!tool || typeof tool.name !== 'string' || !tool.name || names.has(tool.name) || tool.inputSchema?.type !== 'object'
+      || !validAnnotations(tool.annotations)) return false;
     names.add(tool.name);
     return true;
   });

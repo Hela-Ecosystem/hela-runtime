@@ -19,6 +19,14 @@ export interface ToolDescriptor {
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
+/** Annotations may be absent; present ones must be an object whose effect hints, if given, are booleans. */
+export function validAnnotations(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const { readOnlyHint, destructiveHint } = value as Record<string, unknown>;
+  return [readOnlyHint, destructiveHint].every((hint) => hint === undefined || typeof hint === 'boolean');
+}
+
 export interface CellHandle {
   key: string;
   spec: CellSpec;
