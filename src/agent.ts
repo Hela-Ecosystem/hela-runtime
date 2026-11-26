@@ -232,6 +232,34 @@ function expandQuery(tokens: string[]): string[] {
   return [...out];
 }
 
+// A quoted path (may contain spaces), or any word with a slash: paths and URLs name data, not actions.
+const PATH_TOKEN = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]*[/\\][^\s"'`<>()]*/g;
+
+function replacePaths(text: string, placeholder: (value: string) => string): string {
+  return text.replace(PATH_TOKEN, (match: string) => {
+    const punctuation = match.match(/[.,;:!?]+$/)?.[0] ?? '';
+    return ` ${placeholder(match.slice(0, match.length - punctuation.length))}${punctuation}`;
+  });
+}
+
+function fileExtension(value: string): string | undefined {
+  return value.match(/\.([a-z0-9]{1,8})["'`]?$/i)?.[1];
+}
+
+/** For word matching: path segments such as "opencode" must not select tools; a named file still reads as "file". */
+function withoutPaths(text: string): string {
+  return replacePaths(text, (value) => (!value.includes('://') && fileExtension(value) ? 'file' : ''));
+}
+
+/** For intent patterns: keeps only what kind of thing was named (URL, file extension, path). */
+function maskPaths(text: string): string {
+  return replacePaths(text, (value) => {
+    if (value.includes('://')) return 'url';
+    const extension = fileExtension(value);
+    return extension ? `target.${extension}` : 'path';
+  });
+}
+
 interface ScoredDoc {
   tool: AgentTool;
   tf: Map<string, number>;
@@ -255,13 +283,13 @@ function buildDocs(tools: AgentTool[]): ScoredDoc[] {
 }
 
 function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ tool: AgentTool; score: number }> {
-  const raw = [...new Set(tokenize(`${task} ${queryExtra}`))];
+  const raw = [...new Set(tokenize(withoutPaths(`${task} ${queryExtra}`)))];
   if (!raw.length) return [];
   const query = expandQuery(raw);
   const df = new Map<string, number>();
   for (const doc of docs) for (const token of doc.tf.keys()) df.set(token, (df.get(token) ?? 0) + 1);
   const average = docs.reduce((sum, doc) => sum + doc.length, 0) / Math.max(1, docs.length);
-  const lowerTask = task.toLowerCase();
+  const lowerTask = maskPaths(task).toLowerCase();
 
   const scored = docs.map((doc) => {
     let score = 0;
@@ -296,14 +324,61 @@ const PROTECTED_INPUT = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input
 export function forbidsWrites(task: string): boolean {
   return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
 }
-const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|insert|update|rename|truncate|import|archive|upload|drop)(_|$)/i;
+
+/** Verbs in a tool name that change state, each with the wording by which a task asks for that change. */
+const WRITE_ACTION = {
+  verbs: ['write', 'create', 'edit', 'patch', 'insert', 'update', 'save', 'set', 'apply'],
+  request: /\b(write|create|save|make(?!\s+sure)|append|edit|add|insert|update|upgrade|patch|modify|change|overwrite|generate|set|configure|apply|remember|memorize|store|record)\b/i,
+};
+const DELETE_ACTION = {
+  verbs: ['delete', 'remove', 'drop', 'truncate', 'purge', 'prune', 'clear', 'reset', 'destroy'],
+  request: /\b(delete|remove|erase|purge|prune|drop|truncate|clear|clean|wipe|reset|destroy|unlink|rm)\b/i,
+};
+const EXTRACT_ACTION = { verbs: [], request: /\b(extract|unzip|unpack|decompress|untar)\b/i };
+const MUTATIONS: Array<{ verbs: string[]; request: RegExp }> = [
+  WRITE_ACTION,
+  DELETE_ACTION,
+  { verbs: ['move', 'rename'], request: /\b(move|rename|relocate|mv)\b/i },
+  { verbs: ['copy'], request: /\b(copy|duplicate|clone|back\s*up|cp)\b/i },
+  { verbs: ['kill', 'stop', 'close', 'terminate', 'cancel', 'signal'], request: /\b(kill|stop|close|terminate|cancel|signal|interrupt|abort|quit|shut\s*down)\b/i },
+  { verbs: ['install'], request: /\binstall\b/i },
+  { verbs: ['uninstall'], request: /\b(uninstall|remove)\b/i },
+  { verbs: ['import'], request: /\b(import|load|restore)\b/i },
+  { verbs: ['archive'], request: /\b(archive|compress|zip|tar|pack|back\s*up)\b/i },
+  { verbs: ['upload', 'push'], request: /\b(upload|push|send|transfer|attach)\b/i },
+];
+
+function mutationsOf(toolName: string): Array<{ request: RegExp }> {
+  const name = toolName.toLowerCase();
+  // "archive_org_search" and "hela.update.check" only look something up.
+  if (/[_.](search|check)$/.test(name)) return [];
+  if (name === 'extract_archive') return [EXTRACT_ACTION];
+  if (name === 'memory_edit') return [WRITE_ACTION, DELETE_ACTION];
+  const parts = name.split(/[_.]/);
+  return MUTATIONS.filter((mutation) => mutation.verbs.some((verb) => parts.includes(verb)));
+}
+
+function isMutatingTool(toolName: string): boolean {
+  return mutationsOf(toolName).length > 0;
+}
+
+const NEGATED_CLAUSE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n,;]*/gi;
+const QUOTED_TEXT = /(^|\s)(["'`])[^\n]*?\2(?=$|[\s.,;:!?])/g;
+
+/** A mutating tool is eligible only when the task itself asks for its action: not in a path, quote or negation. */
+function taskAllows(toolName: string, task: string): boolean {
+  const mutations = mutationsOf(toolName);
+  if (!mutations.length) return true;
+  const requested = withoutPaths(task).replace(NEGATED_WRITE, ' ').replace(NEGATED_CLAUSE, ' ').replace(QUOTED_TEXT, ' ');
+  return mutations.some((mutation) => mutation.request.test(requested));
+}
 
 const MAX_TRANSIENT_RETRIES = 1;
 const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
 
 /** Only a non-mutating tool failing with a timeout-like error is worth one more attempt. */
 function isTransientReadFailure(tool: AgentTool, error: string): boolean {
-  return !MUTATING_TOOL.test(tool.realName) && TRANSIENT_ERROR.test(error);
+  return !isMutatingTool(tool.realName) && TRANSIENT_ERROR.test(error);
 }
 
 /**
@@ -312,7 +387,7 @@ function isTransientReadFailure(tool: AgentTool, error: string): boolean {
  */
 export function addressesTask(tool: AgentTool, task: string, resultText: string): boolean {
   const subject = task.replace(NEGATED_WRITE, ' ');
-  const query = new Set(expandQuery(tokenize(subject)));
+  const query = new Set(expandQuery(tokenize(withoutPaths(subject))));
   if (tokenize(tool.realName.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
   const result = resultText.toLowerCase();
   return tokenize(subject).some((token) => token.length >= 4 && result.includes(token));
@@ -325,7 +400,7 @@ export function addressesTask(tool: AgentTool, task: string, resultText: string)
  */
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
   if (!forbidsWrites(task)) return tools;
-  const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.realName));
+  const safe = tools.filter((tool) => !isMutatingTool(tool.realName));
   return safe.length ? safe : tools;
 }
 
@@ -334,7 +409,7 @@ export function retrieveTools(tools: AgentTool[], task: string, history: History
   const lastName = tools.find((tool) => tool.name === last?.tool)?.realName ?? last?.tool;
   const queryExtra = last ? `${lastName} ${last.result?.slice(0, 500) ?? ''}` : '';
   const ranked = scoreTools(tools, task, queryExtra).map((entry) => entry.tool);
-  return avoidMutatingTools(ranked, task).slice(0, limit);
+  return avoidMutatingTools(ranked, task).filter((tool) => taskAllows(tool.realName, task)).slice(0, limit);
 }
 
 /* ── deterministic task shaping ────────────────────────────────────────── */
@@ -426,7 +501,7 @@ function mentionedDirectory(text: string): string | undefined {
 }
 
 function shellCommandFor(task: string, modelCommand?: unknown): string | undefined {
-  const lower = task.toLowerCase();
+  const lower = maskPaths(task).toLowerCase();
   const backtick = task.match(/`([^`]{2,300})`/);
   if (backtick) return backtick[1].trim();
   if (/\b(count|how many)\b.*\b(lines?|loc)\b/i.test(lower)) {
@@ -482,7 +557,7 @@ function intentForTool(name: string): string {
 }
 
 function planFor(task: string): PlannedStep[] {
-  const lower = task.toLowerCase();
+  const lower = maskPaths(task).toLowerCase();
   const steps: PlannedStep[] = [];
   const url = extractUrl(task);
   const domain = extractDomain(task);
@@ -498,6 +573,8 @@ function planFor(task: string): PlannedStep[] {
     || hasAny(lower, /\b(browser|web|website|webpage|page|url|headline|screenshot|snapshot|navigate|navigating|tab|render|scroll|browse|browsing)\b/);
 
   if (hasAny(lower, /\b(remember|store in memory|save to memory|knowledge graph|observation)\b/)) {
+    // A memory lookup asks for no write: leave it unplanned so retrieval offers the readers.
+    if (!taskAllows('memory_edit', task)) return steps;
     steps.push({ intent: 'memory', tool: 'memory_edit', description: 'store the information in the project memory graph' });
     return steps;
   }
@@ -1036,9 +1113,10 @@ export class NativeNeedleAgent {
       } else {
         shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST);
       }
-      if (readOnly) shortlist = shortlist.filter((tool) => !MUTATING_TOOL.test(tool.realName));
+      if (readOnly) shortlist = shortlist.filter((tool) => !isMutatingTool(tool.realName));
+      shortlist = shortlist.filter((tool) => taskAllows(tool.realName, task));
       if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
-      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly || (step && !taskAllows(step.tool, task)) ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
 
