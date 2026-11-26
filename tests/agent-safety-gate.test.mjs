@@ -159,6 +159,16 @@ for (const flavour of FLAVOURS) {
     }
   });
 
+  test(`gate (${flavour}): a ban naming a concrete file stays a full write ban`, async () => {
+    const writers = catalogOf(flavour, [['write_file', 'Write a file.', { path: text }], ['copy_file', 'Copy a file.', { path: text }], ['read_file', 'Read a file.', { path: text }]]);
+    for (const task of ['Summarise notes. Do not modify a.txt', 'Read /etc/hosts and do not change /tmp/a.txt', 'Show config.json without editing config.json', 'Copy a.txt to b.txt, do not change /tmp/c.txt']) {
+      for (const want of ['write_file', 'copy_file']) {
+        const { ran, offered, plan } = await run(writers, task, want, { [want]: { path: '/tmp/never' } });
+        for (const list of [ran, offered, plan]) assert.ok(!list.includes(want), `${want}: ${task}`);
+      }
+    }
+  });
+
   test(`gate (${flavour}): a question about deleting is not permission to delete`, async () => {
     const files = catalogOf(flavour, [['delete_file', 'Delete a file the app owns.', { path: text }], ['get_file_info', 'Get file metadata.', { path: text }]]);
     for (const task of ['Tell me which files the app can delete', 'Which files can I delete?', 'Inspect metadata for delete.md.']) {

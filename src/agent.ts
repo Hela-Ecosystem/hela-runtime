@@ -600,6 +600,11 @@ function intentMatch(tool: AgentTool, task: string): { name: number; description
   return { name: count(tool.realName.replace(/_/g, ' ')), description: count(tool.description ?? '') };
 }
 
+function sharesTaskWord(tool: AgentTool, task: string): boolean {
+  const match = intentMatch(tool, task);
+  return match.name + match.description > 0;
+}
+
 /**
  * The read-only tool whose name matches the task best; the description breaks ties, then retrieval order. One shared
  * word is coincidence ("metadata" of a file is not url_metadata_extractor), so the name must carry at least two.
@@ -610,6 +615,14 @@ function bestIntentMatch(shortlist: AgentTool[], task: string): { tool: AgentToo
     .map((tool) => ({ tool, ...intentMatch(tool, task) }))
     .filter((match) => match.name > 1)
     .sort((a, b) => b.name - a.name || b.description - a.description)[0];
+}
+
+/** Whether a successful call could have made the change an unplanned task asks for. A lookup never does. */
+function performsChange(tool: AgentTool, task: string, resultText: string): boolean {
+  if (isReadOnlyTool(tool)) return false;
+  if (mutationsOf(tool.realName).some((mutation) => asksFor(task, [mutation]))) return true;
+  // Shells and page interactions can change anything; they count when the result speaks to the task.
+  return INTERACTIONS.some((action) => action.tools.test(tool.realName)) && addressesTask(tool, task, resultText);
 }
 
 /**
@@ -1321,6 +1334,7 @@ export class NativeNeedleAgent {
 
     const gate = taskGate(task);
     const planned = planFor(task, gate);
+    const changeRequested = !gate.restricted && asksFor(task, [...MUTATIONS, EXTRACT_ACTION]);
     const history: HistoryStep[] = [];
     const notes: string[] = [];
     const retrievedNames = new Set<string>();
@@ -1363,9 +1377,9 @@ export class NativeNeedleAgent {
       if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted || (step && !gate.permits({ realName: step.tool })) ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
-      // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file). A task
-      // asking for a change is left to Needle: a read-only name match would pass as done without changing anything.
-      const lookup = !planned.length && !history.length && !asksFor(task, [...MUTATIONS, EXTRACT_ACTION]);
+      // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file) unless
+      // Needle's pick speaks to the task too. A task asking for a change is left to Needle.
+      const lookup = !planned.length && !history.length && !changeRequested;
       const opening = lookup ? bestIntentMatch(shortlist, task) : undefined;
 
       let chosenName: string | undefined;
@@ -1383,15 +1397,15 @@ export class NativeNeedleAgent {
           break;
         }
       }
-      let chosen = shortlist.find((tool) => tool.name === chosenName) ?? preferred ?? shortlist[0];
+      let chosen = shortlist.find((tool) => tool.name === chosenName) ?? preferred ?? opening?.tool ?? shortlist[0];
       if (step && preferred && chosen && chosen.name !== preferred.name) {
         // The deterministic step says exactly what must happen next. Record
         // Needle's disagreement, then execute the required step.
         notes.push(`step '${step.intent}': needle chose ${chosen.name}, executing ${preferred.name}`);
         chosen = preferred;
       }
-      if (opening && chosen && opening.name > intentMatch(chosen, task).name) {
-        notes.push(`needle chose ${chosen.name}, executing ${opening.tool.name}: its name matches the task better`);
+      if (opening && chosen && chosen.name !== opening.tool.name && !sharesTaskWord(chosen, task)) {
+        notes.push(`needle chose ${chosen.name}, executing ${opening.tool.name}: only the latter matches the task`);
         chosen = opening.tool;
       }
       if (!chosen) { decision = 'no tool selected'; break; }
@@ -1460,13 +1474,15 @@ export class NativeNeedleAgent {
           // Without a deterministic plan the completion predicate is "the result addresses the
           // task": a non-failing call to an unrelated tool (runtime#4: watch_file for a time
           // question) is not an answer, so try other tools until the budget runs out.
-          if (addressesTask(chosen, task, asText(result))) {
+          // A requested change is only answered by a call that could have made it: reading is not deleting.
+          const performed = !changeRequested || performsChange(chosen, task, asText(result));
+          if (performed && (changeRequested || addressesTask(chosen, task, asText(result)))) {
             answered = true;
             decision = `single action complete (${chosen.name})`;
             break;
           }
           unanswered.add(chosen.name);
-          notes.push(`${chosen.name} succeeded but its result does not address the task`);
+          notes.push(`${chosen.name} succeeded but ${performed ? 'its result does not address the task' : 'did not make the requested change'}`);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1492,7 +1508,9 @@ export class NativeNeedleAgent {
     }
     // ok means a call succeeded and the last word was not a failure; degraded means some calls
     // failed along the way or succeeded only partially (same vocabulary as hela_pipe).
-    const failed = succeeded === 0 || lastCallOk === false || decision.startsWith('repeated failing call');
+    const unchanged = changeRequested && !planned.length && !answered;
+    const failed = succeeded === 0 || lastCallOk === false || unchanged || decision.startsWith('repeated failing call');
+    if (unchanged) decision = `requested change not made: ${decision}`;
     // A plan cut short (tool budget, time, no permitted tool) is partial, never a full success.
     const pendingSteps = planned.filter((step) => !completed(step, history)).map((step) => step.intent);
     if (!failed && !planned.length && !answered) degradedReasons.push('no tool result addressed the task');

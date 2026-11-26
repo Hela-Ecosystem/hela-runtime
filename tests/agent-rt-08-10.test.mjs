@@ -20,13 +20,15 @@ const namespaced = (cell, realName, description, properties = {}, required = [])
   inputSchema: { type: 'object', properties, ...(required.length ? { required } : {}) },
 });
 const text = { type: 'string' };
+const bare = (tools) => tools.map((tool) => ({ ...tool, name: tool.realName }));
+const FLAVOURS = [['bare', bare], ['namespaced', (tools) => tools]];
 
 // `pick` stands in for Needle: it sees the shortlist names and returns its choice.
-function agentWith(tools, executeAgentTool, pick) {
+function agentWith(tools, executeAgentTool, pick, args = {}) {
   const host = { agentCatalog: () => tools, agentContext: () => context, executeAgentTool };
   const agent = new NativeNeedleAgent(host, { root: assetRoot, profile: null });
   agent.choose = async (shortlist) => pick(shortlist.map((tool) => tool.name));
-  agent.arguments = async () => ({ args: {} });
+  agent.arguments = async (tool) => ({ args: args[tool.realName] ?? {} });
   return agent;
 }
 
@@ -84,32 +86,37 @@ const risky = [...mutating, ...readers];
 const names = (task, tools = risky) => retrieveTools(tools, task, [], 50).map((tool) => tool.realName);
 const writes = (list) => list.filter((name) => mutating.some((tool) => tool.realName === name));
 
-test('RT-10: the metadata repro never retrieves or runs a mutating tool', async () => {
-  const task = 'Inspect metadata for /tmp/opencode/definitely-missing.md';
-  const seen = [];
-  const agent = agentWith(risky, async (tool) => { seen.push(tool.realName); return envelope({ success: false, error: 'ENOENT' }); }, () => 'hela_ribosome_opencode_session_delete');
-  const planned = await agent.plan({ task, limit: 50 });
-  assert.ok(planned.retrieved.some((tool) => tool.name === 'hela_membrane_get_file_info'));
-  assert.deepEqual(writes(names(task)), []);
-  const result = await agent.run({ task, maxIterations: 6, maxToolCalls: 6 });
-  assert.deepEqual(writes(seen), []);
-  assert.ok(!result.catalog.retrieved.some((name) => mutating.some((tool) => tool.name === name)), JSON.stringify(result.catalog.retrieved));
-});
+for (const [flavour, shape] of FLAVOURS) {
+  const tools = shape(risky);
+  const exposed = (realName) => tools.find((tool) => tool.realName === realName).name;
 
-test('RT-10: path and URL segments do not score tools', () => {
-  for (const task of ['Inspect metadata for /tmp/opencode/x.md', 'Inspect metadata for "/tmp/my opencode/x.md".', 'Inspect metadata for https://example.com/opencode/session', 'Inspect metadata for src/opencode/session']) {
-    assert.deepEqual(names(task, [mutating[0]]), [], task);
-    assert.ok(!names(task).includes('opencode_session_delete'), task);
-  }
-});
+  test(`RT-10 (${flavour}): the metadata repro never retrieves or runs a mutating tool`, async () => {
+    const task = 'Inspect metadata for /tmp/opencode/definitely-missing.md';
+    const seen = [];
+    const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope({ success: false, error: 'ENOENT' }); }, () => exposed('opencode_session_delete'));
+    const planned = await agent.plan({ task, limit: 50 });
+    assert.ok(planned.retrieved.some((tool) => tool.name === exposed('get_file_info')));
+    assert.deepEqual(writes(names(task, tools)), []);
+    const result = await agent.run({ task, maxIterations: 6, maxToolCalls: 6 });
+    assert.deepEqual(writes(seen), []);
+    assert.ok(!result.catalog.retrieved.some((name) => mutating.some((entry) => name === exposed(entry.realName))), JSON.stringify(result.catalog.retrieved));
+  });
 
-test('RT-10: paths, quotes and negations do not unlock an action', () => {
-  for (const task of [
-    'Inspect metadata for /tmp/delete-me/remove.md',
-    'Inspect files that mention "delete the opencode session"',
-    "Inspect the opencode session metadata, don't close or stop it",
-  ]) assert.deepEqual(writes(names(task)), [], task);
-});
+  test(`RT-10 (${flavour}): path and URL segments do not score tools`, () => {
+    for (const task of ['Inspect metadata for /tmp/opencode/x.md', 'Inspect metadata for "/tmp/my opencode/x.md".', 'Inspect metadata for https://example.com/opencode/session', 'Inspect metadata for src/opencode/session']) {
+      assert.deepEqual(names(task, shape([mutating[0]])), [], task);
+      assert.ok(!names(task, tools).includes('opencode_session_delete'), task);
+    }
+  });
+
+  test(`RT-10 (${flavour}): paths, quotes and negations do not unlock an action`, () => {
+    for (const task of [
+      'Inspect metadata for /tmp/delete-me/remove.md',
+      'Inspect files that mention "delete the opencode session"',
+      "Inspect the opencode session metadata, don't close or stop it",
+    ]) assert.deepEqual(writes(names(task, tools)), [], task);
+  });
+}
 
 test('RT-10: a task that asks for a change keeps the tools that perform it', () => {
   assert.ok(names('Delete the opencode session abc123').includes('opencode_session_delete'));
@@ -154,9 +161,6 @@ test('RT-10: an unclosed quote hides nothing, a closed one only its own span', (
   assert.ok(!names("Inspect the opencode session named 'delete me'.").includes('opencode_session_delete'));
 });
 
-const bare = (tools) => tools.map((tool) => ({ ...tool, name: tool.realName }));
-const FLAVOURS = [['bare', bare], ['namespaced', (tools) => tools]];
-
 for (const [flavour, shape] of FLAVOURS) {
   test(`RT-10 (${flavour}): a bare filename is data, not an action`, async () => {
     const tools = shape(risky);
@@ -175,67 +179,108 @@ for (const [flavour, shape] of FLAVOURS) {
 const clock = [
   namespaced('membrane', 'watch_file', 'Watch file or directory for changes.', { path: text }),
   namespaced('membrane', 'read_file', 'Read a file from disk.', { path: text }),
-  namespaced('mitosis', 'convert_time', 'Convert time between timezones', { time: text }),
-  namespaced('mitosis', 'get_current_time', 'Get current time in a specific timezone', { timezone: text }),
-  namespaced('receptor', 'app_current', 'Get the app currently in the foreground.', {}),
+  namespaced('mitosis', 'convert_time', 'Convert time between timezones', { source_timezone: text, time: text, target_timezone: text }, ['source_timezone', 'time', 'target_timezone']),
+  namespaced('mitosis', 'get_current_time', 'Get current time in a specific timezone', { timezone: text }, ['timezone']),
 ];
+const CLOCK_ARGS = {
+  get_current_time: { timezone: 'Asia/Jakarta' },
+  convert_time: { source_timezone: 'UTC', time: '12:00', target_timezone: 'Asia/Jakarta' },
+  watch_file: { path: '/data/x' },
+};
 const NOW = envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T21:30:00+07:00' });
 
-for (const task of ['Tell me the current time in Asia/Jakarta', 'Tell me the current time in Asia/Jakarta. Do not modify any files.']) {
-  for (const choice of ['hela_membrane_watch_file', 'hela_mitosis_convert_time', 'done', undefined]) {
-    test(`RT-08: get_current_time is tried first when Needle answers ${choice}: ${task}`, async () => {
+for (const [flavour, shape] of FLAVOURS) {
+  const tools = shape(clock);
+  const exposed = (realName) => tools.find((tool) => tool.realName === realName)?.name;
+  const start = async (task, choice, outcome = () => NOW) => {
+    const seen = [];
+    const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return outcome(tool.realName); }, () => (choice === 'done' ? choice : exposed(choice)), CLOCK_ARGS);
+    const result = await agent.run({ task, maxIterations: 4, maxToolCalls: 3 });
+    return { seen, result };
+  };
+
+  for (const task of ['Tell me the current time in Asia/Jakarta', 'Tell me the current time in Asia/Jakarta. Do not modify any files.']) {
+    for (const choice of ['watch_file', 'done', undefined]) {
+      test(`RT-08 (${flavour}): get_current_time is tried first when Needle answers ${choice}: ${task}`, async () => {
+        const { seen, result } = await start(task, choice);
+        assert.deepEqual(seen, ['get_current_time'], JSON.stringify(result.notes));
+        assert.equal(result.status, 'ok');
+        assert.equal(result.decision.reason, `single action complete (${exposed('get_current_time')})`);
+      });
+    }
+  }
+
+  test(`RT-08 (${flavour}): a pick that shares a task word is respected`, async () => {
+    for (const task of ['Compare the current time in UTC and Asia/Jakarta', 'Tell me the current time in Asia/Jakarta']) {
+      const { seen, result } = await start(task, 'convert_time');
+      assert.deepEqual(seen, ['convert_time'], task);
+      assert.deepEqual(result.notes, []);
+    }
+  });
+
+  test(`RT-08 (${flavour}): the preference only opens the run, so Needle can move on after a failure`, async () => {
+    const { seen, result } = await start('Tell me the current time in Asia/Jakarta. Do not modify any files.', 'watch_file',
+      (name) => (name === 'watch_file' ? NOW : envelope({ success: false, error: 'bad timezone' })));
+    assert.deepEqual(seen, ['get_current_time', 'watch_file']);
+    assert.equal(result.status, 'degraded');
+  });
+
+  const files08 = shape([
+    namespaced('membrane', 'delete_file', 'Delete a file.', { path: text }),
+    namespaced('membrane', 'get_file_info', 'Get file metadata.', { path: text }),
+    namespaced('membrane', 'write_file', 'Create a file, or delete its content.', { path: text }),
+  ]);
+  const change = async (...picks) => {
+    const seen = [];
+    const agent = agentWith(files08, async (tool) => { seen.push(tool.realName); return envelope('stale file'); },
+      (list) => list.find((name) => picks.some((pick) => name.endsWith(pick) && !seen.includes(pick))) ?? 'done');
+    const result = await agent.run({ task: 'Delete the stale file', maxIterations: 4, maxToolCalls: 3 });
+    return { seen, result };
+  };
+
+  test(`RT-08 (${flavour}): reading, or another change, does not complete a requested deletion`, async () => {
+    for (const pick of ['get_file_info', 'write_file']) {
+      const { seen, result } = await change(pick);
+      assert.deepEqual(seen, [pick]);
+      assert.equal(result.ok, false);
+      assert.equal(result.status, 'failed');
+      assert.match(result.decision.reason, /requested change not made/);
+    }
+  });
+
+  test(`RT-08 (${flavour}): a deletion after a lookup completes the task`, async () => {
+    const seen = [];
+    const agent = agentWith(files08, async (tool) => { seen.push(tool.realName); return envelope('stale file'); },
+      (list) => list.find((name) => name.endsWith(seen.length ? 'delete_file' : 'get_file_info')));
+    const result = await agent.run({ task: 'Delete the stale file', maxIterations: 4, maxToolCalls: 3 });
+    assert.deepEqual(seen, ['get_file_info', 'delete_file']);
+    assert.equal(result.status, 'ok');
+  });
+
+  for (const choice of ['session_signal', undefined, 'done']) {
+    test(`RT-08 (${flavour}): a task asking for a change is never swapped for a read-only name match (${choice})`, async () => {
+      const server = shape([
+        namespaced('ribosome', 'session_signal', 'Kill or signal a session process.', {}),
+        namespaced('ribosome', 'opencode_status', 'Show opencode server status.', {}),
+      ]);
       const seen = [];
-      const agent = agentWith(clock, async (tool) => { seen.push(tool.realName); return NOW; }, () => choice);
-      const result = await agent.run({ task, maxIterations: 4, maxToolCalls: 3 });
-      assert.deepEqual(seen, ['get_current_time'], JSON.stringify(result.notes));
-      assert.equal(result.status, 'ok');
-      assert.match(result.decision.reason, /single action complete \(hela_mitosis_get_current_time\)/);
+      const agent = agentWith(server, async (tool) => { seen.push(tool.realName); return envelope('opencode server'); },
+        (list) => (choice === 'done' ? choice : list.find((name) => name.endsWith(choice))));
+      const result = await agent.run({ task: 'Kill the opencode server', maxIterations: 1 });
+      assert.ok(!result.notes.some((note) => /matches the task/.test(note)), JSON.stringify(result.notes));
+      if (choice === 'session_signal') assert.deepEqual(seen, ['session_signal']);
+      if (choice === 'done') assert.deepEqual(seen, []);
     });
   }
-}
 
-test('RT-08: the preference only opens the run, so Needle can move on after a failure', async () => {
-  const seen = [];
-  const agent = agentWith(clock, async (tool) => {
-    seen.push(tool.realName);
-    return tool.realName === 'convert_time' ? NOW : envelope({ success: false, error: 'bad timezone' });
-  }, () => 'hela_mitosis_convert_time');
-  const result = await agent.run({ task: 'Tell me the current time in Asia/Jakarta', maxIterations: 4, maxToolCalls: 3 });
-  assert.deepEqual(seen, ['get_current_time', 'convert_time']);
-  assert.equal(result.status, 'degraded');
-});
-
-test('RT-08: the preference never switches Needle to a mutating tool', async () => {
-  const tools = [namespaced('membrane', 'delete_file', 'Delete a file.', {}), namespaced('membrane', 'get_file_info', 'Get metadata.', {})];
-  const seen = [];
-  const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('delete file done'); }, () => 'hela_membrane_get_file_info');
-  const result = await agent.run({ task: 'Delete the stale file', maxIterations: 1 });
-  assert.deepEqual(result.notes.filter((note) => /matches the task better/.test(note)), []);
-  assert.deepEqual(seen, ['get_file_info']);
-});
-
-for (const choice of ['hela_ribosome_session_signal', undefined, 'done']) {
-  test(`RT-08: a task asking for a change is never swapped for a read-only name match (${choice})`, async () => {
-    const tools = [
-      namespaced('ribosome', 'session_signal', 'Kill or signal a session process.', {}),
-      namespaced('ribosome', 'opencode_status', 'Show opencode server status.', {}),
-    ];
+  test(`RT-08 (${flavour}): a single shared word does not make a tool the opening`, async () => {
+    const lookups = shape([
+      namespaced('enzyme', 'url_metadata_extractor', 'Extract metadata from a URL.', {}),
+      namespaced('membrane', 'read_file', 'Read a file from disk.', {}),
+    ]);
     const seen = [];
-    const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('opencode server'); }, () => choice);
-    const result = await agent.run({ task: 'Kill the opencode server', maxIterations: 1 });
-    assert.ok(!result.notes.some((note) => /matches the task better/.test(note)), JSON.stringify(result.notes));
-    if (choice === 'hela_ribosome_session_signal') assert.deepEqual(seen, ['session_signal']);
-    if (choice === 'done') assert.deepEqual(seen, []);
+    const agent = agentWith(lookups, async (tool) => { seen.push(tool.realName); return envelope('metadata'); }, (list) => list.find((name) => name.endsWith('read_file')));
+    await agent.run({ task: 'Inspect metadata for /tmp/opencode/definitely-missing.md', maxIterations: 1 });
+    assert.deepEqual(seen, ['read_file']);
   });
 }
-
-test('RT-08: a single shared word does not override Needle', async () => {
-  const tools = [
-    namespaced('enzyme', 'url_metadata_extractor', 'Extract metadata from a URL.', {}),
-    namespaced('membrane', 'read_file', 'Read a file and its metadata.', {}),
-  ];
-  const seen = [];
-  const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('metadata'); }, () => 'hela_membrane_read_file');
-  await agent.run({ task: 'Inspect metadata for /tmp/opencode/definitely-missing.md', maxIterations: 1 });
-  assert.deepEqual(seen, ['read_file']);
-});
