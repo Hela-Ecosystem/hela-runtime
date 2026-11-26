@@ -30,37 +30,49 @@ const catalog = [
 const MUTATING = /(^|_)(write|copy|create|delete|move)(_|$)/;
 const envelope = (value, isError) => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }], ...(isError ? { isError: true } : {}) });
 
+const FLAVOURS = [
+  ['bare', (tools) => tools],
+  ['namespaced', (tools) => tools.map((entry) => ({ ...entry, name: `hela_fixture_${entry.realName}` }))],
+];
+// Needle picks by exposed name; the tests name tools as their cell does.
+const exposedPick = (tools, pick) => tools.find((entry) => entry.realName === pick)?.name ?? pick;
 function agentWith(executeAgentTool, picks, tools = catalog) {
   const host = { agentCatalog: () => tools, agentContext: () => ({ workspaceRoot: '/tmp/ws', cwd: '/tmp/cwd' }), executeAgentTool };
   const agent = new NativeNeedleAgent(host, { root: assetRoot, profile: null });
   const queue = [...picks];
-  agent.choose = async () => (queue.length > 1 ? queue.shift() : queue[0]);
-  agent.arguments = async (selected) => ({ args: selected.name === 'get_current_time' ? { timezone: 'Asia/Jakarta' } : selected.name === 'copy_file' ? { source: '/tmp/a.txt', destination: '/tmp/b.txt' } : selected.name === 'browser_navigate' ? { url: 'https://example.com' } : { path: '/data/x' } });
+  agent.choose = async () => exposedPick(tools, queue.length > 1 ? queue.shift() : queue[0]);
+  agent.arguments = async (selected) => ({ args: selected.realName === 'get_current_time' ? { timezone: 'Asia/Jakarta' } : selected.realName === 'copy_file' ? { source: '/tmp/a.txt', destination: '/tmp/b.txt' } : selected.realName === 'browser_navigate' ? { url: 'https://example.com' } : { path: '/data/x' } });
   return agent;
 }
 
-test('RT-03: a protected target does not ban the permitted copy', async () => {
-  const task = 'Copy /tmp/a.txt to /tmp/b.txt without modifying the original';
-  const plan = (await agentWith(async () => envelope('ok'), []).plan({ task })).plan;
-  assert.deepEqual(plan.map((step) => step.tool), ['copy_file']);
-  const seen = [];
-  const result = await agentWith(async (selected) => { seen.push(selected.name); return envelope({ copied: true }); }, ['copy_file']).run({ task });
-  assert.deepEqual(seen, ['copy_file']);
-  assert.equal(result.status, 'ok');
-  assert.ok(avoidMutatingTools(catalog, task).some((entry) => entry.name === 'copy_file'));
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-03: a protected target does not ban the permitted copy (${flavour})`, async () => {
+    const task = 'Copy /tmp/a.txt to /tmp/b.txt without modifying the original';
+    const plan = (await agentWith(async () => envelope('ok'), [], shape(catalog)).plan({ task })).plan;
+    assert.deepEqual(plan.map((step) => step.tool), ['copy_file']);
+    const seen = [];
+    const result = await agentWith(async (selected) => { seen.push(selected.realName); return envelope({ copied: true }); }, ['copy_file'], shape(catalog)).run({ task });
+    assert.deepEqual(seen, ['copy_file']);
+    assert.equal(result.status, 'ok');
+    assert.ok(avoidMutatingTools(shape(catalog), task).some((entry) => entry.realName === 'copy_file'));
+  });
+}
 
-test('RT-03: a task-wide write ban still blocks mutating tools', async () => {
-  for (const task of ['Do not modify any files. Copy nothing', 'Read notes.txt. Do not edit any files.', 'Summarise the repo and never overwrite existing files', 'List the directory without writing to disk']) {
-    assert.ok(!avoidMutatingTools(catalog, task).some((entry) => entry.name === 'copy_file' || entry.name === 'write_file'), task);
-  }
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-03: a task-wide write ban still blocks mutating tools (${flavour})`, async () => {
+    for (const task of ['Do not modify any files. Copy nothing', 'Read notes.txt. Do not edit any files.', 'Summarise the repo and never overwrite existing files', 'List the directory without writing to disk']) {
+      assert.ok(!avoidMutatingTools(shape(catalog), task).some((entry) => entry.realName === 'copy_file' || entry.realName === 'write_file'), task);
+    }
+  });
+}
 
-test('RT-03: a ban naming a concrete file or path stays a full ban', () => {
-  for (const task of ['Summarise notes. Do not modify a.txt', 'Read /etc/hosts and do not change /tmp/a.txt', 'Show config.json without editing config.json']) {
-    assert.ok(!avoidMutatingTools(catalog, task).some((entry) => entry.name === 'copy_file' || entry.name === 'write_file'), task);
-  }
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-03: a ban naming a concrete file or path stays a full ban (${flavour})`, () => {
+    for (const task of ['Summarise notes. Do not modify a.txt', 'Read /etc/hosts and do not change /tmp/a.txt', 'Show config.json without editing config.json']) {
+      assert.ok(!avoidMutatingTools(shape(catalog), task).some((entry) => entry.realName === 'copy_file' || entry.realName === 'write_file'), task);
+    }
+  });
+}
 
 test('RT-04: a transient read timeout gets one bounded retry, a permanent error none', async () => {
   const task = 'Read notes.txt';
@@ -84,13 +96,15 @@ test('RT-04: a transient read timeout gets one bounded retry, a permanent error 
   assert.equal(permanent.status, 'failed');
 });
 
-test('RT-04: a timed-out copy (mutating) is never retried', async () => {
-  let calls = 0;
-  const result = await agentWith(async () => { calls++; return envelope({ success: false, error: 'timed out' }); }, ['copy_file'])
-    .run({ task: 'Copy /tmp/a.txt to /tmp/b.txt', maxIterations: 6, maxToolCalls: 6 });
-  assert.equal(calls, 1);
-  assert.equal(result.status, 'failed');
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-04: a timed-out copy (mutating) is never retried (${flavour})`, async () => {
+    let calls = 0;
+    const result = await agentWith(async () => { calls++; return envelope({ success: false, error: 'timed out' }); }, ['copy_file'], shape(catalog))
+      .run({ task: 'Copy /tmp/a.txt to /tmp/b.txt', maxIterations: 6, maxToolCalls: 6 });
+    assert.equal(calls, 1);
+    assert.equal(result.status, 'failed');
+  });
+}
 
 test('RT-05: a plan cut short by maxToolCalls is degraded, not ok', async () => {
   const seen = [];
@@ -142,31 +156,37 @@ const WATCHING = envelope({ success: true, message: 'Started watching /data/x' }
 const JAKARTA = envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T21:30:00+07:00' });
 
 test('RT-07: runtime#4 repro - a wrong-tool ok call is not "single action complete"', async () => {
+  // The clock's name shares no word with the task, so the RT-08 opening preference leaves Needle's pick alone.
+  const clockNow = (entry) => ({ ...tool('clock_now', entry.description), annotations: { readOnlyHint: true } });
+  const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? clockNow(entry) : entry));
   const seen = [];
-  const agent = agentWith(async (selected) => { seen.push(selected.name); return selected.name === 'get_current_time' ? JAKARTA : WATCHING; }, ['watch_file', 'get_current_time']);
+  const agent = agentWith(async (selected) => { seen.push(selected.name); return selected.name === 'clock_now' ? JAKARTA : WATCHING; }, ['watch_file', 'clock_now'], unnamedClock);
   const result = await agent.run({ task: TIME_TASK, maxIterations: 5, maxToolCalls: 5 });
-  assert.deepEqual(seen, ['watch_file', 'get_current_time']);
+  assert.deepEqual(seen, ['watch_file', 'clock_now']);
   assert.equal(result.ok, true);
   assert.equal(result.status, 'ok');
-  assert.match(result.decision.reason, /single action complete \(get_current_time\)/);
+  assert.match(result.decision.reason, /single action complete \(clock_now\)/);
 });
 
-test('RT-07: runtime#4 repro - never answered ends degraded after trying the budget', async () => {
-  const withoutClock = catalog.filter((entry) => entry.name !== 'get_current_time');
-  const seen = [];
-  const agent = agentWith(async (selected) => { seen.push(selected.name); return WATCHING; }, ['watch_file'], withoutClock);
-  const result = await agent.run({ task: TIME_TASK, maxIterations: 8, maxToolCalls: 8 });
-  assert.ok(seen.length >= 1);
-  assert.equal(new Set(seen).size, seen.length, 'a tool whose result did not address the task is not repeated');
-  assert.ok(!seen.some((name) => MUTATING.test(name)), `mutating tool ran: ${seen}`);
-  assert.equal(result.ok, true);
-  assert.equal(result.status, 'degraded');
-  assert.doesNotMatch(result.decision.reason, /single action complete/);
-  assert.ok(result.degraded.some((reason) => /no tool result addressed the task/.test(reason)));
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-07: runtime#4 repro - never answered ends degraded after trying the budget (${flavour})`, async () => {
+    const withoutClock = shape(catalog.filter((entry) => entry.realName !== 'get_current_time'));
+    const seen = [];
+    const agent = agentWith(async (selected) => { seen.push(selected.realName); return WATCHING; }, ['watch_file'], withoutClock);
+    const result = await agent.run({ task: TIME_TASK, maxIterations: 8, maxToolCalls: 8 });
+    assert.ok(seen.length >= 1);
+    assert.equal(new Set(seen).size, seen.length, 'a tool whose result did not address the task is not repeated');
+    assert.ok(!seen.some((name) => MUTATING.test(name)), `mutating tool ran: ${seen}`);
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 'degraded');
+    assert.doesNotMatch(result.decision.reason, /single action complete/);
+    assert.ok(result.degraded.some((reason) => /no tool result addressed the task/.test(reason)));
+  });
+}
 
 test('RT-07: a result that echoes the task content counts as an answer', async () => {
-  const result = await agentWith(async () => envelope('It is 21:30 in Jakarta.'), ['watch_file']).run({ task: TIME_TASK, maxIterations: 3, maxToolCalls: 3 });
+  const withoutClock = catalog.filter((entry) => entry.name !== 'get_current_time');
+  const result = await agentWith(async () => envelope('It is 21:30 in Jakarta.'), ['watch_file'], withoutClock).run({ task: TIME_TASK, maxIterations: 3, maxToolCalls: 3 });
   assert.equal(result.status, 'ok');
   assert.equal(result.toolCalls, 1);
 });

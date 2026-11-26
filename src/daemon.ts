@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 import { ManifestStore } from './manifest.js';
-import { NativeNeedleAgent, scoreTools, type AgentContext, type AgentTool } from './agent.js';
+import { NativeNeedleAgent, PermissionVeto, scoreTools, type AgentContext, type AgentTool, type CallPermit } from './agent.js';
 import { VERSION } from './version.js';
 import { classifyToolResult, degradationReasons } from './outcome.js';
 import {
@@ -93,6 +93,7 @@ const runtimeUpdateTools: AgentTool[] = [
     realName: UPDATE_CHECK_TOOL,
     description: 'Read-only check for a newer HeLa ecosystem snapshot. Reports changed cells and never modifies the installation.',
     inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true },
   },
   {
     name: UPDATE_APPLY_TOOL,
@@ -105,6 +106,7 @@ const runtimeUpdateTools: AgentTool[] = [
       required: ['confirm'],
       additionalProperties: false,
     },
+    annotations: { destructiveHint: true },
   },
 ];
 
@@ -137,7 +139,7 @@ export class HelaRuntime {
   lazyCells = new Set<string>();
   server: Server;
   restartAttempts = new Map<string, number>();
-  cachedManifest: Record<string, Array<{ name: string; description?: string; inputSchema: any }>> = {};
+  cachedManifest: Record<string, Array<{ name: string; description?: string; inputSchema: any; annotations?: AgentTool['annotations'] }>> = {};
   booting = new Set<string>();
   private bootTasks = new Map<string, Promise<void>>();
   private restartTimers = new Map<string, NodeJS.Timeout>();
@@ -180,19 +182,28 @@ export class HelaRuntime {
           || excludedAgentCatalogToolNames.has(tool.name)
           || excludedAgentCatalogToolPatterns.some((pattern) => pattern.test(exposed) || pattern.test(tool.name))) continue;
         seen.add(exposed);
-        catalog.push({ name: exposed, cell: cellKey, realName: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+        catalog.push({ name: exposed, cell: cellKey, realName: tool.name, description: tool.description, inputSchema: tool.inputSchema, annotations: tool.annotations });
       }
     }
     return catalog;
   }
 
-  async executeAgentTool(tool: AgentTool, args: Record<string, unknown>): Promise<unknown> {
-    if (tool.cell === RUNTIME_UPDATE_CELL) return this.executeRuntimeUpdate(tool.name, args);
+  async executeAgentTool(tool: AgentTool, args: Record<string, unknown>, permits: CallPermit): Promise<unknown> {
+    const check = (realName: string, annotations: AgentTool['annotations']): void => {
+      if (!permits({ realName, annotations }, args)) throw new PermissionVeto(`Tool ${tool.name} is not permitted for this task`);
+    };
+    if (tool.cell === RUNTIME_UPDATE_CELL) {
+      check(tool.name, runtimeUpdateTools.find((candidate) => candidate.name === tool.name)?.annotations);
+      return this.executeRuntimeUpdate(tool.name, args);
+    }
     let cell = this.cells.get(tool.cell);
     if (!cell?.ready) cell = await this.ensureCell(tool.cell);
     if (!cell?.ready) throw new Error(`Cell not ready: ${tool.cell}`);
     const realName = this.toolToReal.get(tool.name) ?? tool.realName;
-    if (!cell.tools.has(realName)) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
+    const live = cell.tools.get(realName);
+    if (!live) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
+    // The catalog may come from a cached manifest; the cell that is about to run the call has the last word.
+    check(realName, live.annotations);
     return this.invokeTool(tool.cell, realName, () => callTool(cell!, realName, args, this.options.toolTimeoutMs ?? 60000));
   }
 
@@ -692,7 +703,7 @@ export class HelaRuntime {
     const cell = typeof args.cell === 'string' ? args.cell.trim() : '';
     const query = typeof args.query === 'string' ? args.query.trim() : '';
     let tools = cell ? catalog.filter((tool) => tool.cell === cell || tool.cell === `hela-${cell}`) : catalog;
-    if (query) tools = scoreTools(tools, query).map((entry) => entry.tool);
+    if (query) tools = scoreTools(tools, query, { catalog: true }).map((entry) => entry.tool);
     const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.min(300, Math.floor(Number(args.limit)))) : undefined;
     const cells = [...new Set(catalog.map((tool) => tool.cell))];
     return {
@@ -712,7 +723,7 @@ export class HelaRuntime {
     const query = String(args.query ?? '').trim();
     if (!query) return { ok: false, error: 'query is required' };
     const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.min(50, Math.floor(Number(args.limit)))) : 10;
-    const ranked = scoreTools(this.agentCatalog(), query).slice(0, limit);
+    const ranked = scoreTools(this.agentCatalog(), query, { catalog: true }).slice(0, limit);
     return {
       ok: true,
       query,

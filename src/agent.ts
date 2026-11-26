@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { classifyToolResult } from './outcome.js';
+import { validAnnotations } from './types.js';
 
 /**
  * Runtime-native Needle agent.
@@ -33,6 +34,8 @@ export interface AgentTool {
   realName: string;
   description?: string;
   inputSchema: any;
+  /** The cell's own MCP hints about the tool's effects, where it publishes them. */
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
 export interface AgentContext {
@@ -40,9 +43,16 @@ export interface AgentContext {
   cwd: string;
 }
 
+/** The task's permission check for one call, asked about the descriptor and arguments that are about to be used. */
+export type CallPermit = (tool: Pick<AgentTool, 'realName' | 'annotations'>, args: Record<string, unknown>) => boolean;
+
+/** Thrown by a host that refused a call: nothing was sent to a cell. */
+export class PermissionVeto extends Error {}
+
 export interface AgentHost {
   agentCatalog(): AgentTool[];
-  executeAgentTool(tool: AgentTool, args: Record<string, unknown>): Promise<unknown>;
+  /** The host asks `permits` about the live descriptor immediately before invoking, and throws PermissionVeto on a no. */
+  executeAgentTool(tool: AgentTool, args: Record<string, unknown>, permits: CallPermit): Promise<unknown>;
   agentContext(): AgentContext;
 }
 
@@ -232,6 +242,49 @@ function expandQuery(tokens: string[]): string[] {
   return [...out];
 }
 
+// A quoted path (may contain spaces), else one word; words with a slash are paths or URLs, and words ending in a
+// file extension are filenames: both name data, not actions ("delete.md" asks for no deletion). Words are matched
+// whole and filtered afterwards, which stays linear on long input.
+const BARE_FILENAME = /\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|ini|cfg|conf|env|lock|log|bak|tmp|csv|tsv|js|mjs|cjs|ts|tsx|jsx|py|sh|bash|zsh|c|cc|cpp|h|hpp|rs|go|java|kt|php|rb|sql|db|sqlite|css|scss|html?|xml|pdf|png|jpe?g|webp|gif|svg|zip|tar|gz|blend|apk)$/i;
+const QUOTED_PATH_OR_WORD = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]+/g;
+
+/** The word, or its placeholder when it is a path, URL or filename; trailing punctuation stays. */
+function replaceIfPath(word: string, placeholder: (value: string) => string): string {
+  // Scanned backwards: an anchored /[.,;:!?]+$/ is quadratic on long punctuation runs.
+  let end = word.length;
+  while (end > 0 && '.,;:!?'.includes(word[end - 1])) end--;
+  const core = word.slice(0, end);
+  if (!/[/\\]/.test(core) && !BARE_FILENAME.test(core)) return word;
+  return ` ${placeholder(core)}${word.slice(end)}`;
+}
+
+function replacePaths(text: string, placeholder: (value: string) => string): string {
+  return text.replace(QUOTED_PATH_OR_WORD, (match: string, quote?: string) => {
+    // Quoted paths and URLs may hold "," and ";". In a bare path they end it and open the next clause
+    // ("/tmp/report.txt,verify"); a URL stays whole so its tail cannot read as an instruction.
+    if (quote || match.includes('://')) return replaceIfPath(match, placeholder);
+    return match.split(/([,;])/).map((piece, index) => (index % 2 ? piece : replaceIfPath(piece, placeholder))).join('');
+  });
+}
+
+function fileExtension(value: string): string | undefined {
+  return value.match(/\.([a-z0-9]{1,8})["'`]?$/i)?.[1];
+}
+
+/** For word matching: path segments such as "opencode" must not select tools; a named file still reads as "file". */
+function withoutPaths(text: string): string {
+  return replacePaths(text, (value) => (!value.includes('://') && fileExtension(value) ? 'file' : ''));
+}
+
+/** For intent patterns: keeps only what kind of thing was named (URL, file extension, path). */
+function maskPaths(text: string): string {
+  return replacePaths(text, (value) => {
+    if (value.includes('://')) return 'url';
+    const extension = fileExtension(value);
+    return extension ? `target.${extension}` : 'path';
+  });
+}
+
 interface ScoredDoc {
   tool: AgentTool;
   tf: Map<string, number>;
@@ -239,9 +292,9 @@ interface ScoredDoc {
   nameTokens: Set<string>;
 }
 
-function buildDocs(tools: AgentTool[]): ScoredDoc[] {
+function buildDocs(tools: AgentTool[], withCell: boolean): ScoredDoc[] {
   return tools.map((tool) => {
-    const name = tool.name.replace(/_/g, ' ');
+    const name = `${withCell ? `${tool.cell} ` : ''}${tool.realName}`.replace(/_/g, ' ');
     const text = `${name} ${name} ${tool.description ?? ''} ${JSON.stringify(tool.inputSchema?.properties ?? {})}`;
     const tf = new Map<string, number>();
     for (const token of tokenize(text)) tf.set(token, (tf.get(token) ?? 0) + 1);
@@ -254,14 +307,15 @@ function buildDocs(tools: AgentTool[]): ScoredDoc[] {
   });
 }
 
-function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ tool: AgentTool; score: number }> {
-  const raw = [...new Set(tokenize(`${task} ${queryExtra}`))];
+/** `words` are matched against the documents; `phrasing`, given for a task only, is what the intent boosts read. */
+function scoreDocs(docs: ScoredDoc[], words: string, phrasing?: string): Array<{ tool: AgentTool; score: number }> {
+  const raw = [...new Set(tokenize(words))];
   if (!raw.length) return [];
   const query = expandQuery(raw);
   const df = new Map<string, number>();
   for (const doc of docs) for (const token of doc.tf.keys()) df.set(token, (df.get(token) ?? 0) + 1);
   const average = docs.reduce((sum, doc) => sum + doc.length, 0) / Math.max(1, docs.length);
-  const lowerTask = task.toLowerCase();
+  const lower = phrasing?.toLowerCase();
 
   const scored = docs.map((doc) => {
     let score = 0;
@@ -272,8 +326,10 @@ function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ to
       score += idf * (frequency * 2.2) / (frequency + 1.2 * (0.25 + 0.75 * doc.length / Math.max(1, average)));
       if (doc.nameTokens.has(token)) score += idf * 1.8;
     }
-    for (const rule of INTENT_BOOSTS) {
-      if (rule.pattern.test(lowerTask) && rule.names.includes(doc.tool.name)) score += rule.boost;
+    if (lower !== undefined) {
+      for (const rule of INTENT_BOOSTS) {
+        if (rule.pattern.test(lower) && rule.names.includes(doc.tool.realName)) score += rule.boost;
+      }
     }
     return { tool: doc.tool, score };
   });
@@ -281,8 +337,14 @@ function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ to
   return scored.filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score);
 }
 
-export function scoreTools(tools: AgentTool[], task: string, queryExtra = ''): Array<{ tool: AgentTool; score: number }> {
-  return scoreDocs(buildDocs(tools), task, queryExtra);
+/**
+ * Ranks tools for a query. A catalog search is someone looking a tool up: the cell name counts, paths are searched as
+ * written and no task-intent boost applies (words are still stemmed and widened by synonyms). Otherwise the text is a
+ * task, where a cell name or a path must not select tools and the intent boosts apply.
+ */
+export function scoreTools(tools: AgentTool[], query: string, options: { catalog?: boolean; context?: string } = {}): Array<{ tool: AgentTool; score: number }> {
+  if (options.catalog) return scoreDocs(buildDocs(tools, true), query);
+  return scoreDocs(buildDocs(tools, false), withoutPaths(`${query} ${options.context ?? ''}`), maskPaths(query));
 }
 
 // "Do not modify any files", "never write", "without changing": the task forbids writes.
@@ -292,18 +354,321 @@ const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\
 // whether a chosen write would land on that file, so every mutating tool is withheld.
 const PROTECTED_INPUT = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input)\b/i;
 
+/** Typed apostrophes ("don’t") must ban the same things as straight ones. */
+function straightQuotes(text: string): string {
+  return text.replace(/\u2019/g, "'");
+}
+
 /** True when the task bans writes outright; only a ban scoped to the task's own input leaves other writes allowed. */
 export function forbidsWrites(task: string): boolean {
-  return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
+  return [...straightQuotes(task).matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
 }
-const MUTATING_TOOL = /(^|_)(write|create|delete|remove|move|copy|edit|patch|insert|update|rename|truncate|import|archive|upload|drop)(_|$)/i;
+
+/** Verbs in a tool name that change state, each with the wording by which a task asks for that change. */
+const WRITE_ACTION = {
+  verbs: ['write', 'create', 'edit', 'patch', 'insert', 'update', 'save', 'set', 'apply'],
+  request: /\b(write|create|save|make(?!\s+sure)|append|edit|add|insert|update|upgrade|patch|modify|change|overwrite|generate|set|configure|apply|remember|memorize|store|record|provision|fix|repair)\b/i,
+  forbidding: /\b(?:writ(?:e|es|ing)|creat\w*|edit\w*|modif\w*|chang(?:e|es|ing)|updat\w*|sav(?:e|es|ing)|append\w*|overwrit\w*|alter(?:ing)?|add(?:ing)?|insert\w*|remember\w*|stor(?:e|es|ing))\b/i,
+};
+const DELETE_ACTION = {
+  verbs: ['delete', 'remove', 'drop', 'truncate', 'purge', 'prune', 'clear', 'reset', 'destroy'],
+  request: /\b(delete|remove|erase|purge|prune|drop|truncate|clear|clean|wipe|reset|destroy|unlink|rm)\b/i,
+  forbidding: /\b(?:delet\w*|remov\w*|eras\w*|purg\w*|wip(?:e|es|ing)|drop(?:s|ping)?|truncat\w*|clear(?:ing)?|reset\w*|destroy\w*)\b/i,
+};
+interface Mutation { verbs: string[]; request: RegExp; forbidding: RegExp }
+const EXTRACT_ACTION: Mutation = { verbs: [], request: /\b(extract|unzip|unpack|decompress|untar)\b/i, forbidding: /\b(?:extract\w*|unzip\w*|unpack\w*)\b/i };
+const MUTATIONS: Mutation[] = [
+  WRITE_ACTION,
+  DELETE_ACTION,
+  { verbs: ['move', 'rename'], request: /\b(move|rename|relocate|mv)\b/i, forbidding: /\b(?:mov(?:e|es|ing)|renam\w*)\b/i },
+  { verbs: ['copy'], request: /\b(copy|duplicate|clone|back\s*up|cp)\b/i, forbidding: /\b(?:cop(?:y|ies|ying)|duplicat\w*|clon(?:e|es|ing))\b/i },
+  {
+    verbs: ['kill', 'stop', 'close', 'terminate', 'cancel', 'signal'],
+    request: /\b(kill|stop|close|terminate|cancel|signal|interrupt|abort|quit|shut\s*down)\b/i,
+    forbidding: /\b(?:kill\w*|stop(?:s|ping)?|clos(?:e|es|ing)|terminat\w*|cancel\w*|signal\w*)\b/i,
+  },
+  { verbs: ['install'], request: /\binstall\b/i, forbidding: /\binstall\w*\b/i },
+  { verbs: ['uninstall'], request: /\b(uninstall|remove)\b/i, forbidding: /\b(?:uninstall\w*|remov\w*)\b/i },
+  { verbs: ['import'], request: /\b(import|load|restore)\b/i, forbidding: /\bimport\w*\b/i },
+  { verbs: ['archive'], request: /\b(archive|compress|zip|tar|pack|back\s*up)\b/i, forbidding: /\b(?:archiv\w*|compress\w*|zip\w*)\b/i },
+  { verbs: ['upload', 'push'], request: /\b(upload|push|send|transfer|attach)\b/i, forbidding: /\b(?:upload\w*|push\w*|send\w*)\b/i },
+];
+
+/** Tools that run whatever they are handed, so a ban on any change they could make reaches them too. */
+const RUNS_ANYTHING = /^(?:execute_command|execute_sql|execute_blender_code|shell_exec|session_spawn|session_write|agent_spawn)$/;
+
+/** Actions that are not visible in a tool's verbs: the wording that bans them, and the tools that perform them. */
+const INTERACTIONS: Array<{ forbidding: RegExp; tools: RegExp }> = [
+  {
+    forbidding: /\b(?:click\w*|tap(?:s|ping)?|interact\w*|select(?:ing)?)\b/i,
+    tools: /^(?:browser_(?:click|download_click|press|check|uncheck|select|select_by_index|drag|dialog|dismiss_popups|fill_form|batch_answer_quiz|solve_captcha_grid|handle_captcha|replay_macro|parallel_execute|evaluate)|tap|long_press|swipe|drag_drop|key_event|ui_tap_element|ui_smart_fill|form_fill)$/,
+  },
+  {
+    forbidding: /\b(?:typ(?:e|es|ing)|fill\w*|enter(?:ing)?|input\w*|interact\w*)\b/i,
+    tools: /^(?:browser_(?:type|clear|fill_form|batch_answer_quiz|replay_macro|parallel_execute|evaluate)|input_text|key_event|clipboard_set|ui_smart_fill|form_fill)$/,
+  },
+  {
+    forbidding: /\b(?:submit\w*|press\w*|send\w*|post(?:ing)?)\b/i,
+    tools: /^(?:browser_(?:press|click|download_click|fill_form|batch_answer_quiz|replay_macro|parallel_execute|evaluate)|tap|key_event|ui_tap_element|ui_smart_fill|form_fill)$/,
+  },
+  { forbidding: /\b(?:navigat\w*|visit\w*|brows(?:e|ing))\b/i, tools: /^browser_(?:navigate|search|new_tab|back|forward|reload)$/ },
+  { forbidding: /\b(?:screenshot\w*|captur\w*)\b/i, tools: /^(?:browser_)?screenshot$/ },
+  { forbidding: /\b(?:run(?:ning)?|execut\w*)\b/i, tools: RUNS_ANYTHING },
+];
+
+function mutationsOf(toolName: string): Mutation[] {
+  const name = toolName.toLowerCase();
+  // "archive_org_search" and "hela.update.check" only look something up.
+  if (/[_.](search|check)$/.test(name)) return [];
+  if (name === 'extract_archive') return [EXTRACT_ACTION];
+  if (name === 'memory_edit') return [WRITE_ACTION, DELETE_ACTION];
+  const parts = name.split(/[_.]/);
+  return MUTATIONS.filter((mutation) => mutation.verbs.some((verb) => parts.includes(verb)));
+}
+
+function isMutatingTool(toolName: string): boolean {
+  return mutationsOf(toolName).length > 0;
+}
+
+const OPENING_QUOTE = /(?<=^|\s)["'`]/g;
+const CLOSING_QUOTE = /["'`](?=$|[\s.,;:!?])/g;
+
+/**
+ * Drops quoted spans: from a quote starting a word to the next same quote ending one. Unclosed quotes stay.
+ * Closers are indexed once, so many unclosed quotes cannot make this rescan the line.
+ */
+function withoutQuoted(line: string): string {
+  const closers = new Map<string, { at: number[]; next: number }>();
+  for (const match of line.matchAll(CLOSING_QUOTE)) {
+    const entry = closers.get(match[0]) ?? { at: [], next: 0 };
+    entry.at.push(match.index);
+    closers.set(match[0], entry);
+  }
+  let kept = '';
+  let from = 0;
+  for (const match of line.matchAll(OPENING_QUOTE)) {
+    const entry = closers.get(match[0]);
+    if (!entry || match.index < from) continue;
+    while (entry.next < entry.at.length && entry.at[entry.next] <= match.index) entry.next++;
+    if (entry.next === entry.at.length) continue;
+    kept += `${line.slice(from, match.index)} `;
+    from = entry.at[entry.next] + 1;
+  }
+  return kept + line.slice(from);
+}
+
+const NEGATOR = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid|refrain\s+from|no\s+need\s+to|no(?=\s+[a-z]+ing\b))\b/i;
+// A ban ends at a contrast, or at "and" opening a new request ("do not click Delete and take a screenshot").
+const NEGATION_BOUNDARY = /(,|\b(?:but|instead|however|then)\b|\band\b(?=\s+(?:also\s+)?(?:take|open|navigate|go|visit|tell|show|list|read|report|inspect|check|verify|search|find|capture|summari[sz]e)\b))/i;
+// Past a comma it continues only through a list: "do not click, type, or submit".
+const LIST_ITEM = /^\s*(?:(?:or|nor)\b|(?:and\s+)?[a-z]+(?:\s+(?:or|nor)\b|\s*$))/i;
+// Nothing banned yet, so the ban reaches over the comma: "do not, under any circumstances, delete".
+const NO_VERB_YET = /^\s*(?:(?:ever|under|at|for|in|on|please)\b.*)?$/i;
+
+/** Separates what a text asks for from what it bans. One pass over its sentences and clauses. */
+function splitNegations(text: string): { affirmative: string; negated: string[] } {
+  const negated: string[] = [];
+  const affirmative = straightQuotes(text).split(/([.!?;\n])/).map((sentence) => {
+    let banning = false;
+    let awaitingVerb = false;
+    return sentence.split(NEGATION_BOUNDARY).map((part, index, parts) => {
+      if (index % 2) return part;
+      if (banning && parts[index - 1] === ',' && (awaitingVerb || LIST_ITEM.test(part))) {
+        negated[negated.length - 1] += `,${part}`;
+        awaitingVerb = awaitingVerb && NO_VERB_YET.test(part);
+        return ' ';
+      }
+      const found = part.match(NEGATOR);
+      banning = found !== null;
+      if (!found) return part;
+      const start = found.index ?? 0;
+      awaitingVerb = NO_VERB_YET.test(part.slice(start + found[0].length));
+      negated.push(part.slice(start));
+      return `${part.slice(0, start)} `;
+    }).join('');
+  }).join('');
+  return { affirmative, negated };
+}
+
+/** A text without its bans. */
+function affirmativeText(text: string): string {
+  return splitNegations(text).affirmative;
+}
+
+// A list of write verbs and, captured, the task's own input as its object ("changing or deleting the source file"),
+// with any further determined objects ("the original or the copy"): those are things protected, not further bans.
+// The object is optional so that a long verb list is consumed in one match rather than retried from every verb.
+const PROTECTED_PHRASE = /\b(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*(?:[\s,]+(?:(?:or|and|nor)[\s,]+)?(?:modif|chang|edit|writ|creat|delet|remov|alter|overwrit|touch|mutat|sav)\w*)*(\s+(?:(?:the|its|their)\s+)?(?:original|source|input)\b(?:\s+(?:source|input|files?|data|documents?|images?)\b)*(?:\s*(?:,\s*)?(?:or|and|nor)\s+(?:the|its|their)\s+\w+(?:\s+(?:copy|copies|files?|data|documents?|images?)\b)*)*)?/gi;
+
+/**
+ * The wording of every banned action. Protecting the task's own input bans nothing by itself, so that phrase is cut
+ * out; whatever else the same clause bans ("... or click anything") stays banned.
+ */
+function bannedText(task: string): string {
+  return splitNegations(replacePaths(task, () => ' ')).negated
+    .map((span) => span.replace(PROTECTED_PHRASE, (phrase: string, input?: string) => (input ? ' ' : phrase)))
+    .join('\n');
+}
+
+/** The task's own wording of what it wants: negated clauses removed, each path or filename replaced. */
+function requestedText(task: string, placeholder = ''): string {
+  return affirmativeText(replacePaths(task, () => placeholder));
+}
+
+/** As requestedText, without quoted text: what the task itself says. */
+function spokenText(task: string, placeholder = ''): string {
+  return requestedText(task, placeholder).split('\n').map(withoutQuoted).join('\n');
+}
+
+function asksFor(task: string, mutations: Mutation[]): boolean {
+  const spoken = spokenText(task);
+  return mutations.some((mutation) => mutation.request.test(spoken));
+}
+
+const CLAUSE_BREAK = /[.!?;:,\n]|\b(?:and|then|but)\b/i;
+const LEAD_FILLER = /^[\s"'`(*-]*(?:(?:hey|hi|hello|ok|okay|so|please|kindly|can you|could you|would you|will you|i (?:want|need|would like)(?: you)? to|let'?s|now|first|firstly|finally|also|just|next|quickly|carefully|briefly)\b\s*)*/i;
+const PREPOSITION_LEAD = /^(?:in|on|for|from|under|at|inside|within|using|with|after|before|given)\b/i;
+const LOOKUP_LEAD = /^(?:know|see|tell|show|list|inspect|read|view|describe|explain|check|count|find|locate|measure|summari[sz]e|report|search|look|get|fetch|give|display|print|compare|examine|analy[sz]e|review|audit|identify|determine|verify|assert|confirm|enumerate|query|which|what|who|when|where|why|how|is|are|was|were|does|did|can|could)\b/i;
+const OTHER_ACTION_LEAD = /^(?:click|tap|type|press|submit|fill|enter|select|drag|swipe|run|execute|start|restart|launch|spawn|open|build|compile|deploy|commit|post|download|connect|disconnect|rotate|turn|lock|unlock|enable|disable|format|merge|release|publish|schedule|pay|buy|order)\b/i;
+
+function leadsWithAction(clause: string): boolean {
+  return OTHER_ACTION_LEAD.test(clause) || [...MUTATIONS, EXTRACT_ACTION].some((mutation) => clause.match(mutation.request)?.index === 0);
+}
+
+/**
+ * True when the task only asks to find something out: it opens as a lookup or a question and no clause opens with an
+ * action. Verbs further in ("which files the app can delete") describe; an unknown opening verb is not read-only.
+ */
+function isReadOnlyTask(task: string): boolean {
+  const clauses = spokenText(task, 'target').split(CLAUSE_BREAK).map((clause) => clause.replace(LEAD_FILLER, '')).filter(Boolean);
+  const opening = clauses.find((clause) => !PREPOSITION_LEAD.test(clause));
+  return opening !== undefined && LOOKUP_LEAD.test(opening) && !clauses.some(leadsWithAction);
+}
+
+/**
+ * Tools without effects, for cells that publish no hints. Deliberately explicit: a tool missing here is refused to
+ * read-only tasks, which is the safe way to be wrong.
+ */
+const READ_ONLY_TOOLS = new Set([
+  'hela.update.check',
+  // files and terminals
+  'read_file', 'list_directory', 'find_files', 'search_in_files', 'get_file_info', 'get_directory_size', 'compare_files', 'watch_file',
+  'terminal_ls', 'terminal_cat', 'terminal_grep', 'terminal_session_list', 'session_list', 'session_info',
+  'opencode_status', 'opencode_stats', 'opencode_models', 'opencode_mcp_list', 'opencode_auth_list',
+  // memory
+  'search_nodes', 'read_graph', 'read_graph_stream', 'open_node', 'query_data', 'search_priors', 'list_missions', 'get_timeline',
+  'get_session_context', 'get_file_context', 'get_project_guidance', 'inspect_untrusted_text', 'analyze_git_changes',
+  // time, skills and instructions
+  'get_current_time', 'convert_time', 'list_skills', 'get_skill', 'search_skills', 'load_instruction', 'search_instructions',
+  'get_prompt', 'search_prompts', 'get_resource_set', 'search_resource_sets', 'list_mcp_servers',
+  // research
+  'google_search', 'wikipedia_search', 'wikipedia_get', 'wikipedia_get_pages_in_category', 'wikipedia_page_languages',
+  'wikipedia_random', 'academic_search', 'multi_site_search', 'archive_org_search', 'search_trends', 'fact_checker',
+  'extract_content', 'url_metadata_extractor',
+  // browser: loading and observing a page
+  'browser_navigate', 'browser_search', 'browser_get_state', 'browser_get_content', 'browser_screenshot', 'browser_assert',
+  // design and 3D lookups
+  'brand_list', 'list_themes', 'list_options', 'list_installed_skills', 'list_ellis_ui_designs', 'get_ellis_ui_template',
+  'get_component', 'get_reference', 'get_cross_cutting_rules', 'get_scene_summary', 'get_object_details',
+  'get_blendfile_summary', 'get_api_docs', 'get_blender_helpers', 'get_modeling_patterns', 'get_agent_instructions',
+]);
+
+type GatedTool = Pick<AgentTool, 'realName' | 'annotations'>;
+
+/** A hint or a name that says "changes state" wins; otherwise a read-only hint or the allow-list is required. */
+function isReadOnlyTool(tool: GatedTool): boolean {
+  // Live tool lists are not validated on the way in: hints that cannot be read count as a refusal.
+  if (!validAnnotations(tool.annotations)) return false;
+  const { readOnlyHint, destructiveHint } = tool.annotations ?? {};
+  if (destructiveHint === true || readOnlyHint === false || isMutatingTool(tool.realName)) return false;
+  return readOnlyHint === true || READ_ONLY_TOOLS.has(tool.realName);
+}
+
+const HEADLINE_CHECK = 'document.querySelector("h1") && document.querySelector("h1").innerText.trim().length > 0';
+
+/** Arguments can give a read-only tool effects: script URLs and page JavaScript. */
+function hasReadOnlyArgs(toolName: string, args: Record<string, unknown>): boolean {
+  if (toolName === 'browser_navigate') return /^https?:\/\//i.test(String(args.url));
+  if (toolName === 'browser_assert' && (args.type ?? args.conditionType) === 'js') {
+    return args.target === HEADLINE_CHECK && args.condition === undefined;
+  }
+  return true;
+}
+
+/**
+ * The one permission check: planning, retrieval and dispatch all ask it. A banned action ("do not click") is refused
+ * to every task. A write-banned or read-only task gets only read-only tools. The single exception is a read-only task (no ban) that matches one of the runtime's own
+ * side-effect-free diagnostics: the shell may then run exactly that command and nothing else.
+ */
+function taskGate(task: string) {
+  const banned = forbidsWrites(task);
+  const restricted = banned || isReadOnlyTask(task);
+  const fixed = restricted && !banned ? runtimeCommand(task) : undefined;
+  const diagnostic = fixed?.readOnly ? fixed.command : undefined;
+  const bans = bannedText(task);
+  const isBanned = (toolName: string) => mutationsOf(toolName).some((mutation) => mutation.forbidding.test(bans))
+    || INTERACTIONS.some((action) => action.tools.test(toolName) && action.forbidding.test(bans))
+    || (RUNS_ANYTHING.test(toolName) && [...MUTATIONS, EXTRACT_ACTION].some((mutation) => mutation.forbidding.test(bans)));
+  return {
+    restricted,
+    /** Without args: may the tool be planned or offered. With args: may this call be dispatched. */
+    permits(tool: GatedTool, args?: Record<string, unknown>): boolean {
+      if (isBanned(tool.realName)) return false;
+      if (!restricted) return true;
+      if (!validAnnotations(tool.annotations)) return false;
+      if (tool.realName === 'execute_command') {
+        return diagnostic !== undefined && (!args
+          || (args.command === diagnostic && Object.keys(args).every((key) => key === 'command' || key === 'workingDirectory')));
+      }
+      return isReadOnlyTool(tool) && (!args || hasReadOnlyArgs(tool.realName, args));
+    },
+  };
+}
+
+type TaskGate = ReturnType<typeof taskGate>;
 
 const MAX_TRANSIENT_RETRIES = 1;
 const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
 
 /** Only a non-mutating tool failing with a timeout-like error is worth one more attempt. */
-function isTransientReadFailure(toolName: string, error: string): boolean {
-  return !MUTATING_TOOL.test(toolName) && TRANSIENT_ERROR.test(error);
+function isTransientReadFailure(tool: AgentTool, error: string): boolean {
+  return !isMutatingTool(tool.realName) && TRANSIENT_ERROR.test(error);
+}
+
+/** How many task words a tool carries in its name, and in its description. */
+function intentMatch(tool: AgentTool, task: string): { name: number; description: number } {
+  const words = [...new Set(tokenize(requestedText(task)))];
+  const count = (text: string) => {
+    const tokens = new Set(tokenize(text));
+    return words.filter((word) => tokens.has(word)).length;
+  };
+  return { name: count(tool.realName.replace(/_/g, ' ')), description: count(tool.description ?? '') };
+}
+
+function sharesTaskWord(tool: AgentTool, task: string): boolean {
+  const match = intentMatch(tool, task);
+  return match.name + match.description > 0;
+}
+
+/**
+ * The read-only tool whose name matches the task best; the description breaks ties, then retrieval order. One shared
+ * word is coincidence ("metadata" of a file is not url_metadata_extractor), so the name must carry at least two.
+ */
+function bestIntentMatch(shortlist: AgentTool[], task: string): { tool: AgentTool; name: number } | undefined {
+  return shortlist
+    .filter(isReadOnlyTool)
+    .map((tool) => ({ tool, ...intentMatch(tool, task) }))
+    .filter((match) => match.name > 1)
+    .sort((a, b) => b.name - a.name || b.description - a.description)[0];
+}
+
+/** Whether a successful call could have made the change an unplanned task asks for. A lookup never does. */
+function performsChange(tool: AgentTool, task: string, resultText: string): boolean {
+  if (isReadOnlyTool(tool)) return false;
+  const mutations = mutationsOf(tool.realName);
+  if (mutations.length) return mutations.some((mutation) => asksFor(task, [mutation]));
+  // A name with no change verb (a shell, a click, "cache") may change anything: it counts when its result speaks to the task.
+  return addressesTask(tool, task, resultText);
 }
 
 /**
@@ -312,8 +677,8 @@ function isTransientReadFailure(toolName: string, error: string): boolean {
  */
 export function addressesTask(tool: AgentTool, task: string, resultText: string): boolean {
   const subject = task.replace(NEGATED_WRITE, ' ');
-  const query = new Set(expandQuery(tokenize(subject)));
-  if (tokenize(tool.name.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
+  const query = new Set(expandQuery(tokenize(withoutPaths(subject))));
+  if (tokenize(tool.realName.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
   const result = resultText.toLowerCase();
   return tokenize(subject).some((token) => token.length >= 4 && result.includes(token));
 }
@@ -325,15 +690,16 @@ export function addressesTask(tool: AgentTool, task: string, resultText: string)
  */
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
   if (!forbidsWrites(task)) return tools;
-  const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
+  const safe = tools.filter((tool) => !isMutatingTool(tool.realName));
   return safe.length ? safe : tools;
 }
 
-export function retrieveTools(tools: AgentTool[], task: string, history: HistoryStep[] = [], limit = MAX_SHORTLIST): AgentTool[] {
+export function retrieveTools(tools: AgentTool[], task: string, history: HistoryStep[] = [], limit = MAX_SHORTLIST, gate: TaskGate = taskGate(task)): AgentTool[] {
   const last = [...history].reverse().find((step) => step.ok && step.result);
-  const queryExtra = last ? `${last.tool} ${last.result?.slice(0, 500) ?? ''}` : '';
-  const ranked = scoreTools(tools, task, queryExtra).map((entry) => entry.tool);
-  return avoidMutatingTools(ranked, task).slice(0, limit);
+  const lastName = tools.find((tool) => tool.name === last?.tool)?.realName ?? last?.tool;
+  const queryExtra = last ? `${lastName} ${last.result?.slice(0, 500) ?? ''}` : '';
+  const ranked = scoreTools(tools, task, { context: queryExtra }).map((entry) => entry.tool);
+  return avoidMutatingTools(ranked, task).filter((tool) => gate.permits(tool)).slice(0, limit);
 }
 
 /* ── deterministic task shaping ────────────────────────────────────────── */
@@ -424,26 +790,33 @@ function mentionedDirectory(text: string): string | undefined {
   return match?.[1];
 }
 
-function shellCommandFor(task: string, modelCommand?: unknown): string | undefined {
-  const lower = task.toLowerCase();
-  const backtick = task.match(/`([^`]{2,300})`/);
-  if (backtick) return backtick[1].trim();
+/** Commands the runtime writes itself; readOnly marks those without side effects. The first match wins. */
+const RUNTIME_COMMANDS: Array<{ pattern: RegExp; command: string; readOnly: boolean }> = [
+  { pattern: /\b(disk|df|free space|filesystem usage)\b.*\b(usage|space|large|biggest|largest|files)?\b/, command: "df -h; echo '--- largest files ---'; du -ah . 2>/dev/null | sort -rh | head -20", readOnly: true },
+  { pattern: /\b(large|biggest|largest)\b.*\bfiles?\b/, command: "du -ah . 2>/dev/null | sort -rh | head -20", readOnly: true },
+  { pattern: /\bnpm test\b|\brun (the )?tests?\b|\btest suite\b/, command: 'npm test', readOnly: false },
+  { pattern: /\bgit diff\b/, command: 'git diff --stat; git diff', readOnly: true },
+  { pattern: /\bgit status\b/, command: 'git status --short --branch', readOnly: true },
+  { pattern: /\b(list|show)\b.*\b(files|directory|folder)\b/, command: 'ls -la', readOnly: true },
+  { pattern: /\b(processes|ps|memory usage|free memory)\b/, command: 'ps aux --sort=-%mem | head -15; free -h', readOnly: true },
+  { pattern: /\b(node|npm|pnpm|yarn) version\b/, command: 'node --version; npm --version', readOnly: true },
+  { pattern: /\bpwd|current directory\b/, command: 'pwd', readOnly: true },
+];
+
+function runtimeCommand(task: string): { command: string; readOnly: boolean } | undefined {
+  const lower = affirmativeText(maskPaths(task)).toLowerCase();
   if (/\b(count|how many)\b.*\b(lines?|loc)\b/i.test(lower)) {
     const dir = mentionedDirectory(task) ?? '.';
-    return `find ${dir} -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mjs' \\) -print0 | xargs -0 wc -l | sort -n | tail -20`;
+    return { command: `find ${dir} -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mjs' \\) -print0 | xargs -0 wc -l | sort -n | tail -20`, readOnly: true };
   }
-  const commands: Array<{ pattern: RegExp; command: string }> = [
-    { pattern: /\b(disk|df|free space|filesystem usage)\b.*\b(usage|space|large|biggest|largest|files)?\b/, command: "df -h; echo '--- largest files ---'; du -ah . 2>/dev/null | sort -rh | head -20" },
-    { pattern: /\b(large|biggest|largest)\b.*\bfiles?\b/, command: "du -ah . 2>/dev/null | sort -rh | head -20" },
-    { pattern: /\bnpm test\b|\brun (the )?tests?\b|\btest suite\b/, command: 'npm test' },
-    { pattern: /\bgit diff\b/, command: 'git diff --stat; git diff' },
-    { pattern: /\bgit status\b/, command: 'git status --short --branch' },
-    { pattern: /\b(list|show)\b.*\b(files|directory|folder)\b/, command: 'ls -la' },
-    { pattern: /\b(processes|ps|memory usage|free memory)\b/, command: 'ps aux --sort=-%mem | head -15; free -h' },
-    { pattern: /\b(node|npm|pnpm|yarn) version\b/, command: 'node --version; npm --version' },
-    { pattern: /\bpwd|current directory\b/, command: 'pwd' },
-  ];
-  for (const entry of commands) if (entry.pattern.test(lower)) return entry.command;
+  return RUNTIME_COMMANDS.find((entry) => entry.pattern.test(lower));
+}
+
+function shellCommandFor(task: string, modelCommand?: unknown): string | undefined {
+  const backtick = task.match(/`([^`]{2,300})`/);
+  if (backtick) return backtick[1].trim();
+  const fixed = runtimeCommand(task);
+  if (fixed) return fixed.command;
   if (typeof modelCommand === 'string') {
     const value = modelCommand.trim();
     if (value && value !== 'bash' && value !== 'sh' && !/^(check|list|run|execute|command)\b/i.test(value)) return value;
@@ -480,8 +853,22 @@ function intentForTool(name: string): string {
   return 'other';
 }
 
-function planFor(task: string): PlannedStep[] {
-  const lower = task.toLowerCase();
+/**
+ * The catalog entry for a planned (cell) tool name: the exposed name first, since plans name tools as their cell does
+ * and a namespaced catalog exposes them under another name.
+ */
+function plannedTool(catalog: AgentTool[], name: string): AgentTool | undefined {
+  return catalog.find((tool) => tool.name === name) ?? catalog.find((tool) => tool.realName === name);
+}
+
+function planFor(task: string, gate: TaskGate, catalog: AgentTool[]): PlannedStep[] {
+  // The same question run() asks, about the same descriptor and its hints. A tool the catalog lacks has only a name.
+  const allows = (name: string) => gate.permits(plannedTool(catalog, name) ?? { realName: name });
+  return draftPlan(task, allows).filter((step) => allows(step.tool));
+}
+
+function draftPlan(task: string, allows: (toolName: string) => boolean): PlannedStep[] {
+  const lower = affirmativeText(maskPaths(task)).toLowerCase();
   const steps: PlannedStep[] = [];
   const url = extractUrl(task);
   const domain = extractDomain(task);
@@ -497,6 +884,8 @@ function planFor(task: string): PlannedStep[] {
     || hasAny(lower, /\b(browser|web|website|webpage|page|url|headline|screenshot|snapshot|navigate|navigating|tab|render|scroll|browse|browsing)\b/);
 
   if (hasAny(lower, /\b(remember|store in memory|save to memory|knowledge graph|observation)\b/)) {
+    // A memory lookup asks for no write: leave it unplanned so retrieval offers the readers.
+    if (!asksFor(task, [WRITE_ACTION, DELETE_ACTION])) return steps;
     steps.push({ intent: 'memory', tool: 'memory_edit', description: 'store the information in the project memory graph' });
     return steps;
   }
@@ -515,7 +904,7 @@ function planFor(task: string): PlannedStep[] {
   }
   const localExplore = hasAny(lower, /\b(find|locate|count|inspect|measure)\b/)
     && hasAny(lower, /\b(files?|director(?:y|ies)|source|code|repo(?:sitory)?|runtime|packages?|typescript|\.ts|\.js|\.mjs)\b/);
-  if (!browser && (shellIntent || localExplore)) {
+  if (!browser && (shellIntent || localExplore) && allows('execute_command')) {
     steps.push({ intent: 'shell', tool: 'execute_command', description: 'run the shell command for this task' });
     return steps;
   }
@@ -641,11 +1030,14 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
   const searchTerm = extractSearchTerm(task);
   const expected = extractExpectedText(task);
   const lower = task.toLowerCase();
-  const byName = tool.name;
+  const byName = tool.realName;
 
   if (byName === 'execute_command') {
     delete args.host;
     delete args.username;
+    if (taskGate(task).restricted) {
+      for (const key of Object.keys(args)) if (key !== 'command') delete args[key];
+    }
     if (!hasAny(lower, /\b(ssh|remote|host)\b/)) repairs.push('host/username: local execution');
     if (typeof args.session === 'string' && !hasAny(lower, /\bsession\b/)) {
       delete args.session;
@@ -706,7 +1098,7 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
       const query = searchTerm && searchTerm.length < 80 ? searchTerm : 'HeLa';
       // If a separate type/press step follows, open the main page so the
       // search box is available; otherwise deep-link to search results.
-      const willType = hasAny(lower, /\b(search|find|look up|lookup)\b/);
+      const willType = hasAny(lower, /\b(search|find|look up|lookup)\b/) && taskGate(task).permits({ realName: 'browser_type' });
       set('url', willType ? 'https://en.wikipedia.org/wiki/Main_Page' : `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(query)}`, 'Wikipedia page URL');
     } else if (url) {
       set('url', url, 'extracted URL');
@@ -735,7 +1127,7 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
       delete args.condition;
     } else {
       set('type', 'js', 'assert JavaScript condition');
-      set('target', 'document.querySelector("h1") && document.querySelector("h1").innerText.trim().length > 0', 'headline presence check');
+      set('target', HEADLINE_CHECK, 'headline presence check');
       delete args.expected;
       delete args.condition;
     }
@@ -809,7 +1201,26 @@ function resolveSystemPath(root: string, profile: string | null): string | undef
 }
 
 function plannerDescription(tool: AgentTool): string {
-  return PLANNER_HINTS[tool.name] ?? tool.description ?? tool.name;
+  return PLANNER_HINTS[tool.realName] ?? tool.description ?? tool.realName;
+}
+
+/**
+ * What the model calls each tool, keyed by exposed name: the cell's own name, so its choices do not depend on the
+ * namespacing mode. The cell is added only where two tools would otherwise share a name.
+ */
+function modelNames(tools: AgentTool[]): Map<string, string> {
+  const unique = [...new Map(tools.map((tool) => [tool.name, tool])).values()];
+  const count = (names: string[]) => names.reduce((counts, name) => counts.set(name, (counts.get(name) ?? 0) + 1), new Map<string, number>([[DONE_TOOL, 1]]));
+  const real = count(unique.map((tool) => tool.realName));
+  const preferred = unique.map((tool) => (real.get(tool.realName) === 1 ? tool.realName : `${tool.cell.replace(/^hela-/, '')}_${tool.realName}`));
+  const taken = count(preferred);
+  // Exposed names are unique by construction, so they settle whatever the cell prefix could not.
+  return new Map(unique.map((tool, index) => [tool.name, taken.get(preferred[index]) === 1 ? preferred[index] : tool.name]));
+}
+
+/** The latest actions as the model reads them, under the same names as its declarations. */
+function describeHistory(history: HistoryStep[], names: Map<string, string>, resultLimit: number): string {
+  return history.slice(-4).map((entry) => `${names.get(entry.tool) ?? entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, resultLimit) : `ERROR ${entry.error ?? ''}`}`).join('\n');
 }
 
 /**
@@ -914,14 +1325,20 @@ export class NativeNeedleAgent {
     }
   }
 
-  private async choose(shortlist: AgentTool[], task: string, step: PlannedStep | undefined, history: HistoryStep[]): Promise<string | undefined> {
+  /** Model names for the declared tools and for every tool the shown history mentions. */
+  private namesFor(declared: AgentTool[], history: HistoryStep[], known: Map<string, AgentTool>): Map<string, string> {
+    return modelNames([...declared, ...history.slice(-4).flatMap((entry) => known.get(entry.tool) ?? [])]);
+  }
+
+  private async choose(shortlist: AgentTool[], task: string, step: PlannedStep | undefined, history: HistoryStep[], known = new Map<string, AgentTool>()): Promise<string | undefined> {
+    const names = this.namesFor(shortlist, history, known);
     const declarations = shortlist.map((tool) => ({
-      name: tool.name,
+      name: names.get(tool.name) ?? tool.name,
       description: plannerDescription(tool),
       parameters: { type: 'object', properties: {} },
     }));
     declarations.push({ name: DONE_TOOL, description: 'Call this when the task is complete and no further tool action is needed.', parameters: { type: 'object', properties: {} } });
-    const historyText = history.slice(-4).map((entry) => `${entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, 300) : `ERROR ${entry.error ?? ''}`}`).join('\n');
+    const historyText = describeHistory(history, names, 300);
     const prompt = [
       `Task: ${task}`,
       step ? `Current step: ${step.description}.` : 'Choose the next action that makes progress.',
@@ -932,11 +1349,12 @@ export class NativeNeedleAgent {
     const result = await this.invoke(declarations, prompt);
     const call = result.function_calls?.[0] ?? result.suppressed_calls?.[0];
     if (call?.name === DONE_TOOL) return DONE_TOOL;
-    if (call?.name && (shortlist.some((tool) => tool.name === call.name) || call.name === DONE_TOOL)) return call.name;
-    return undefined;
+    return shortlist.find((tool) => names.get(tool.name) === call?.name)?.name;
   }
 
-  private async arguments(tool: AgentTool, task: string, step: PlannedStep | undefined, history: HistoryStep[]): Promise<{ args: Record<string, unknown>; confidence?: number; reasoning?: string }> {
+  private async arguments(tool: AgentTool, task: string, step: PlannedStep | undefined, history: HistoryStep[], known = new Map<string, AgentTool>()): Promise<{ args: Record<string, unknown>; confidence?: number; reasoning?: string }> {
+    const names = this.namesFor([tool], history, known);
+    const name = names.get(tool.name) ?? tool.name;
     const hint: Record<string, string> = {
       execute_command: 'Provide the bash command to run. Use df -h for disk usage, npm test for tests, git status/diff for repository state.',
       write_file: 'Provide path and content. Use an absolute path under the workspace root when possible.',
@@ -950,18 +1368,18 @@ export class NativeNeedleAgent {
       academic_search: 'Provide the search query.',
       wikipedia_search: 'Provide the search query.',
     };
-    const description = `${plannerDescription(tool)}${hint[tool.name] ? ` ${hint[tool.name]}` : ''}`;
-    const historyText = history.slice(-4).map((entry) => `${entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, 400) : `ERROR ${entry.error ?? ''}`}`).join('\n');
+    const description = `${plannerDescription(tool)}${hint[tool.realName] ? ` ${hint[tool.realName]}` : ''}`;
+    const historyText = describeHistory(history, names, 400);
     const prompt = [
       `Task: ${task}`,
       step ? `Current step: ${step.description}.` : '',
-      `Chosen tool: ${tool.name}.`,
+      `Chosen tool: ${name}.`,
       `Workspace root: ${this.host.agentContext().workspaceRoot}`,
       `Current directory: ${this.host.agentContext().cwd}`,
       historyText ? `Recent actions:\n${historyText}` : '',
       'Generate the arguments for this tool call.',
     ].filter(Boolean).join('\n');
-    const result = await this.invoke([{ name: tool.name, description, parameters: compactParameters(tool.inputSchema) }], prompt);
+    const result = await this.invoke([{ name, description, parameters: compactParameters(tool.inputSchema) }], prompt);
     const call = result.function_calls?.[0] ?? result.suppressed_calls?.[0];
     const args = call?.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments) ? call.arguments as Record<string, unknown> : {};
     return { args, confidence: result.confidence, reasoning: result.reasoning };
@@ -971,7 +1389,7 @@ export class NativeNeedleAgent {
     const task = String(args.task ?? '').trim();
     if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const catalog = this.catalog();
-    const plan = planFor(task);
+    const plan = planFor(task, taskGate(task), catalog);
     const retrieved = retrieveTools(catalog, task, [], Math.max(MAX_SHORTLIST, Number(args.limit) || MAX_SHORTLIST));
     return {
       ok: true,
@@ -996,8 +1414,10 @@ export class NativeNeedleAgent {
     const health = this.health();
     if (!health.ok) return { ok: false, status: 'failed', error: health.detail, health };
 
-    const planned = planFor(task);
-    const readOnly = forbidsWrites(task);
+    const gate = taskGate(task);
+    const planned = planFor(task, gate, catalog);
+    const known = new Map(catalog.map((tool) => [tool.name, tool]));
+    const changeRequested = !gate.restricted && asksFor(task, [...MUTATIONS, EXTRACT_ACTION]);
     const history: HistoryStep[] = [];
     const notes: string[] = [];
     const retrievedNames = new Set<string>();
@@ -1011,8 +1431,8 @@ export class NativeNeedleAgent {
     const unanswered = new Set<string>();
     const degradedReasons: string[] = [];
     const failedCalls = new Map<string, { error: string; retries: number; transient: boolean }>();
-    const recordFailure = (key: string, toolName: string, error: string) => {
-      failedCalls.set(key, { error, retries: failedCalls.get(key)?.retries ?? 0, transient: isTransientReadFailure(toolName, error) });
+    const recordFailure = (key: string, tool: AgentTool, error: string) => {
+      failedCalls.set(key, { error, retries: failedCalls.get(key)?.retries ?? 0, transient: isTransientReadFailure(tool, error) });
     };
 
     while (iterations < maxIterations && toolCalls < maxToolCalls && Date.now() - started < maxExecutionMs) {
@@ -1022,59 +1442,67 @@ export class NativeNeedleAgent {
 
       let shortlist: AgentTool[];
       if (step) {
-        const plannedTool = catalog.find((tool) => tool.name === step.tool);
+        const target = plannedTool(catalog, step.tool);
         // Keep the shortlist inside the step's intent family. Needle was
         // choosing write_file for a navigate step when the shortlist mixed
         // families, which executed the wrong action.
-        const alternatives = retrieveTools(catalog, `${task} ${step.description}`, history, MAX_SHORTLIST * 3)
-          .filter((tool) => intentForTool(tool.name) === step.intent || tool.name === step.tool);
-        shortlist = [plannedTool, ...alternatives].filter((tool): tool is AgentTool => Boolean(tool))
+        const alternatives = retrieveTools(catalog, `${task} ${step.description}`, history, MAX_SHORTLIST * 3, gate)
+          .filter((tool) => intentForTool(tool.realName) === step.intent || tool.realName === step.tool);
+        shortlist = [target, ...alternatives].filter((tool): tool is AgentTool => Boolean(tool))
           .filter((tool, index, all) => all.findIndex((candidate) => candidate.name === tool.name) === index)
           .slice(0, MAX_SHORTLIST);
       } else {
-        shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST);
+        shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST, gate);
       }
-      if (readOnly) shortlist = shortlist.filter((tool) => !MUTATING_TOOL.test(tool.name));
+      shortlist = shortlist.filter((tool) => gate.permits(tool));
       if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
-      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
-      const preferred = shortlist.find((tool) => tool.name === step?.tool);
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted || (step && !gate.permits(plannedTool(catalog, step.tool) ?? { realName: step.tool })) ? 'no permitted tools' : 'no relevant tools'; break; }
+      const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
+      // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file) unless
+      // Needle's pick speaks to the task too. A task asking for a change is left to Needle.
+      const lookup = !planned.length && !history.length && !changeRequested;
+      const opening = lookup ? bestIntentMatch(shortlist, task) : undefined;
 
       let chosenName: string | undefined;
       try {
-        chosenName = await this.choose(shortlist, task, step, history);
+        chosenName = await this.choose(shortlist, task, step, history, known);
       } catch (error) {
         return { ok: false, status: 'failed', error: error instanceof Error ? error.message : String(error), health, plan: planned, history };
       }
 
       if (chosenName === DONE_TOOL) {
-        if (step) {
-          chosenName = preferred?.name;
+        if (step || opening) {
+          chosenName = preferred?.name ?? opening?.tool.name;
         } else {
           decision = 'needle reported done';
           break;
         }
       }
-      let chosen = shortlist.find((tool) => tool.name === chosenName) ?? preferred ?? shortlist[0];
+      let chosen = shortlist.find((tool) => tool.name === chosenName) ?? preferred ?? opening?.tool ?? shortlist[0];
       if (step && preferred && chosen && chosen.name !== preferred.name) {
         // The deterministic step says exactly what must happen next. Record
         // Needle's disagreement, then execute the required step.
         notes.push(`step '${step.intent}': needle chose ${chosen.name}, executing ${preferred.name}`);
         chosen = preferred;
       }
+      if (opening && chosen && chosen.name !== opening.tool.name && !sharesTaskWord(chosen, task)) {
+        notes.push(`needle chose ${chosen.name}, executing ${opening.tool.name}: only the latter matches the task`);
+        chosen = opening.tool;
+      }
       if (!chosen) { decision = 'no tool selected'; break; }
 
       let generated: { args: Record<string, unknown>; confidence?: number; reasoning?: string };
       try {
-        generated = await this.arguments(chosen, task, step, history);
+        generated = await this.arguments(chosen, task, step, history, known);
       } catch (error) {
-        history.push({ iteration: iterations, intent: intentForTool(chosen.name), tool: chosen.name, args: {}, ok: false, error: error instanceof Error ? error.message : String(error), ms: 0 });
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: {}, ok: false, error: error instanceof Error ? error.message : String(error), ms: 0 });
         continue;
       }
       const repaired = repairArgs(chosen, generated.args, task, history, this.host.agentContext());
       const validation = validateArgs(chosen, repaired.args);
       if (!validation.ok) {
-        history.push({ iteration: iterations, intent: intentForTool(chosen.name), tool: chosen.name, args: repaired.args, ok: false, error: `${validation.error}; repairs=${repaired.repairs.join(', ')}`, ms: 0 });
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: repaired.args, ok: false, error: `${validation.error}; repairs=${repaired.repairs.join(', ')}`, ms: 0 });
         continue;
       }
 
@@ -1090,9 +1518,21 @@ export class NativeNeedleAgent {
         previousFailure.retries++;
       }
 
+      // The only way to a cell: whatever planning or the model chose, the gate sees the final arguments. The host
+      // asks it again about the live descriptor, which can differ from the cached one the catalog was built from.
+      const block = (): void => {
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: repaired.args, ok: false, error: 'not permitted for this task', ms: 0 });
+        lastCallOk = false;
+        decision = `blocked by the permission gate (${chosen.name})`;
+      };
+      if (!gate.permits(chosen, repaired.args)) {
+        block();
+        break;
+      }
+
       const callStarted = Date.now();
       try {
-        const result = await this.host.executeAgentTool(chosen, repaired.args);
+        const result = await this.host.executeAgentTool(chosen, repaired.args, (live, args) => gate.permits(live, args));
         const ms = Date.now() - callStarted;
         toolCalls++;
         // Cells report failure in the payload (isError, success:false, ok:false), not by
@@ -1100,7 +1540,7 @@ export class NativeNeedleAgent {
         const outcome = classifyToolResult(result);
         history.push({
           iteration: iterations,
-          intent: intentForTool(chosen.name),
+          intent: intentForTool(chosen.realName),
           tool: chosen.name,
           args: repaired.args,
           ok: outcome.ok,
@@ -1111,7 +1551,7 @@ export class NativeNeedleAgent {
         lastCallOk = outcome.ok;
         if (!outcome.ok) {
           failedCount++;
-          recordFailure(callKey, chosen.name, outcome.error ?? 'failed');
+          recordFailure(callKey, chosen, outcome.error ?? 'failed');
           continue;
         }
         succeeded++;
@@ -1120,19 +1560,25 @@ export class NativeNeedleAgent {
           // Without a deterministic plan the completion predicate is "the result addresses the
           // task": a non-failing call to an unrelated tool (runtime#4: watch_file for a time
           // question) is not an answer, so try other tools until the budget runs out.
-          if (addressesTask(chosen, task, asText(result))) {
+          // A requested change is only answered by a call that could have made it: reading is not deleting.
+          const performed = !changeRequested || performsChange(chosen, task, asText(result));
+          if (performed && (changeRequested || addressesTask(chosen, task, asText(result)))) {
             answered = true;
             decision = `single action complete (${chosen.name})`;
             break;
           }
           unanswered.add(chosen.name);
-          notes.push(`${chosen.name} succeeded but its result does not address the task`);
+          notes.push(`${chosen.name} succeeded but ${performed ? 'its result does not address the task' : 'did not make the requested change'}`);
         }
       } catch (error) {
+        if (error instanceof PermissionVeto) {
+          block();
+          break;
+        }
         const message = error instanceof Error ? error.message : String(error);
         history.push({
           iteration: iterations,
-          intent: intentForTool(chosen.name),
+          intent: intentForTool(chosen.realName),
           tool: chosen.name,
           args: repaired.args,
           ok: false,
@@ -1141,7 +1587,7 @@ export class NativeNeedleAgent {
         });
         lastCallOk = false;
         failedCount++;
-        recordFailure(callKey, chosen.name, message);
+        recordFailure(callKey, chosen, message);
       }
     }
 
@@ -1152,7 +1598,9 @@ export class NativeNeedleAgent {
     }
     // ok means a call succeeded and the last word was not a failure; degraded means some calls
     // failed along the way or succeeded only partially (same vocabulary as hela_pipe).
-    const failed = succeeded === 0 || lastCallOk === false || decision.startsWith('repeated failing call');
+    const unchanged = changeRequested && !planned.length && !answered;
+    const failed = succeeded === 0 || lastCallOk === false || unchanged || decision.startsWith('repeated failing call');
+    if (unchanged) decision = `requested change not made: ${decision}`;
     // A plan cut short (tool budget, time, no permitted tool) is partial, never a full success.
     const pendingSteps = planned.filter((step) => !completed(step, history)).map((step) => step.intent);
     if (!failed && !planned.length && !answered) degradedReasons.push('no tool result addressed the task');
