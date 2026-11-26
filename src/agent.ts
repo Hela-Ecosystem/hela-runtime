@@ -1151,7 +1151,26 @@ function resolveSystemPath(root: string, profile: string | null): string | undef
 }
 
 function plannerDescription(tool: AgentTool): string {
-  return PLANNER_HINTS[tool.realName] ?? tool.description ?? tool.name;
+  return PLANNER_HINTS[tool.realName] ?? tool.description ?? tool.realName;
+}
+
+/**
+ * What the model calls each tool, keyed by exposed name: the cell's own name, so its choices do not depend on the
+ * namespacing mode. The cell is added only where two tools would otherwise share a name.
+ */
+function modelNames(tools: AgentTool[]): Map<string, string> {
+  const unique = [...new Map(tools.map((tool) => [tool.name, tool])).values()];
+  const count = (names: string[]) => names.reduce((counts, name) => counts.set(name, (counts.get(name) ?? 0) + 1), new Map<string, number>([[DONE_TOOL, 1]]));
+  const real = count(unique.map((tool) => tool.realName));
+  const preferred = unique.map((tool) => (real.get(tool.realName) === 1 ? tool.realName : `${tool.cell.replace(/^hela-/, '')}_${tool.realName}`));
+  const taken = count(preferred);
+  // Exposed names are unique by construction, so they settle whatever the cell prefix could not.
+  return new Map(unique.map((tool, index) => [tool.name, taken.get(preferred[index]) === 1 ? preferred[index] : tool.name]));
+}
+
+/** The latest actions as the model reads them, under the same names as its declarations. */
+function describeHistory(history: HistoryStep[], names: Map<string, string>, resultLimit: number): string {
+  return history.slice(-4).map((entry) => `${names.get(entry.tool) ?? entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, resultLimit) : `ERROR ${entry.error ?? ''}`}`).join('\n');
 }
 
 /**
@@ -1256,14 +1275,20 @@ export class NativeNeedleAgent {
     }
   }
 
-  private async choose(shortlist: AgentTool[], task: string, step: PlannedStep | undefined, history: HistoryStep[]): Promise<string | undefined> {
+  /** Model names for the declared tools and for every tool the shown history mentions. */
+  private namesFor(declared: AgentTool[], history: HistoryStep[], known: Map<string, AgentTool>): Map<string, string> {
+    return modelNames([...declared, ...history.slice(-4).flatMap((entry) => known.get(entry.tool) ?? [])]);
+  }
+
+  private async choose(shortlist: AgentTool[], task: string, step: PlannedStep | undefined, history: HistoryStep[], known = new Map<string, AgentTool>()): Promise<string | undefined> {
+    const names = this.namesFor(shortlist, history, known);
     const declarations = shortlist.map((tool) => ({
-      name: tool.name,
+      name: names.get(tool.name) ?? tool.name,
       description: plannerDescription(tool),
       parameters: { type: 'object', properties: {} },
     }));
     declarations.push({ name: DONE_TOOL, description: 'Call this when the task is complete and no further tool action is needed.', parameters: { type: 'object', properties: {} } });
-    const historyText = history.slice(-4).map((entry) => `${entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, 300) : `ERROR ${entry.error ?? ''}`}`).join('\n');
+    const historyText = describeHistory(history, names, 300);
     const prompt = [
       `Task: ${task}`,
       step ? `Current step: ${step.description}.` : 'Choose the next action that makes progress.',
@@ -1274,11 +1299,12 @@ export class NativeNeedleAgent {
     const result = await this.invoke(declarations, prompt);
     const call = result.function_calls?.[0] ?? result.suppressed_calls?.[0];
     if (call?.name === DONE_TOOL) return DONE_TOOL;
-    if (call?.name && (shortlist.some((tool) => tool.name === call.name) || call.name === DONE_TOOL)) return call.name;
-    return undefined;
+    return shortlist.find((tool) => names.get(tool.name) === call?.name)?.name;
   }
 
-  private async arguments(tool: AgentTool, task: string, step: PlannedStep | undefined, history: HistoryStep[]): Promise<{ args: Record<string, unknown>; confidence?: number; reasoning?: string }> {
+  private async arguments(tool: AgentTool, task: string, step: PlannedStep | undefined, history: HistoryStep[], known = new Map<string, AgentTool>()): Promise<{ args: Record<string, unknown>; confidence?: number; reasoning?: string }> {
+    const names = this.namesFor([tool], history, known);
+    const name = names.get(tool.name) ?? tool.name;
     const hint: Record<string, string> = {
       execute_command: 'Provide the bash command to run. Use df -h for disk usage, npm test for tests, git status/diff for repository state.',
       write_file: 'Provide path and content. Use an absolute path under the workspace root when possible.',
@@ -1293,17 +1319,17 @@ export class NativeNeedleAgent {
       wikipedia_search: 'Provide the search query.',
     };
     const description = `${plannerDescription(tool)}${hint[tool.realName] ? ` ${hint[tool.realName]}` : ''}`;
-    const historyText = history.slice(-4).map((entry) => `${entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, 400) : `ERROR ${entry.error ?? ''}`}`).join('\n');
+    const historyText = describeHistory(history, names, 400);
     const prompt = [
       `Task: ${task}`,
       step ? `Current step: ${step.description}.` : '',
-      `Chosen tool: ${tool.name}.`,
+      `Chosen tool: ${name}.`,
       `Workspace root: ${this.host.agentContext().workspaceRoot}`,
       `Current directory: ${this.host.agentContext().cwd}`,
       historyText ? `Recent actions:\n${historyText}` : '',
       'Generate the arguments for this tool call.',
     ].filter(Boolean).join('\n');
-    const result = await this.invoke([{ name: tool.name, description, parameters: compactParameters(tool.inputSchema) }], prompt);
+    const result = await this.invoke([{ name, description, parameters: compactParameters(tool.inputSchema) }], prompt);
     const call = result.function_calls?.[0] ?? result.suppressed_calls?.[0];
     const args = call?.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments) ? call.arguments as Record<string, unknown> : {};
     return { args, confidence: result.confidence, reasoning: result.reasoning };
@@ -1340,6 +1366,7 @@ export class NativeNeedleAgent {
 
     const gate = taskGate(task);
     const planned = planFor(task, gate);
+    const known = new Map(catalog.map((tool) => [tool.name, tool]));
     const changeRequested = !gate.restricted && asksFor(task, [...MUTATIONS, EXTRACT_ACTION]);
     const history: HistoryStep[] = [];
     const notes: string[] = [];
@@ -1390,7 +1417,7 @@ export class NativeNeedleAgent {
 
       let chosenName: string | undefined;
       try {
-        chosenName = await this.choose(shortlist, task, step, history);
+        chosenName = await this.choose(shortlist, task, step, history, known);
       } catch (error) {
         return { ok: false, status: 'failed', error: error instanceof Error ? error.message : String(error), health, plan: planned, history };
       }
@@ -1418,7 +1445,7 @@ export class NativeNeedleAgent {
 
       let generated: { args: Record<string, unknown>; confidence?: number; reasoning?: string };
       try {
-        generated = await this.arguments(chosen, task, step, history);
+        generated = await this.arguments(chosen, task, step, history, known);
       } catch (error) {
         history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: {}, ok: false, error: error instanceof Error ? error.message : String(error), ms: 0 });
         continue;
