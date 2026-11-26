@@ -43,9 +43,16 @@ export interface AgentContext {
   cwd: string;
 }
 
+/** The task's permission check for one call, asked about the descriptor and arguments that are about to be used. */
+export type CallPermit = (tool: Pick<AgentTool, 'realName' | 'annotations'>, args: Record<string, unknown>) => boolean;
+
+/** Thrown by a host that refused a call: nothing was sent to a cell. */
+export class PermissionVeto extends Error {}
+
 export interface AgentHost {
   agentCatalog(): AgentTool[];
-  executeAgentTool(tool: AgentTool, args: Record<string, unknown>): Promise<unknown>;
+  /** The host asks `permits` about the live descriptor immediately before invoking, and throws PermissionVeto on a no. */
+  executeAgentTool(tool: AgentTool, args: Record<string, unknown>, permits: CallPermit): Promise<unknown>;
   agentContext(): AgentContext;
 }
 
@@ -1479,17 +1486,21 @@ export class NativeNeedleAgent {
         previousFailure.retries++;
       }
 
-      // The only way to a cell: whatever planning or the model chose, the gate sees the final arguments.
-      if (!gate.permits(chosen, repaired.args)) {
-        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: repaired.args, ok: false, error: 'not permitted for a read-only task', ms: 0 });
+      // The only way to a cell: whatever planning or the model chose, the gate sees the final arguments. The host
+      // asks it again about the live descriptor, which can differ from the cached one the catalog was built from.
+      const block = (): void => {
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: repaired.args, ok: false, error: 'not permitted for this task', ms: 0 });
         lastCallOk = false;
         decision = `blocked by the permission gate (${chosen.name})`;
+      };
+      if (!gate.permits(chosen, repaired.args)) {
+        block();
         break;
       }
 
       const callStarted = Date.now();
       try {
-        const result = await this.host.executeAgentTool(chosen, repaired.args);
+        const result = await this.host.executeAgentTool(chosen, repaired.args, (live, args) => gate.permits(live, args));
         const ms = Date.now() - callStarted;
         toolCalls++;
         // Cells report failure in the payload (isError, success:false, ok:false), not by
@@ -1528,6 +1539,10 @@ export class NativeNeedleAgent {
           notes.push(`${chosen.name} succeeded but ${performed ? 'its result does not address the task' : 'did not make the requested change'}`);
         }
       } catch (error) {
+        if (error instanceof PermissionVeto) {
+          block();
+          break;
+        }
         const message = error instanceof Error ? error.message : String(error);
         history.push({
           iteration: iterations,

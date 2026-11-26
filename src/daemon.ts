@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process';
 import type { CellSpec, CellHandle } from './types.js';
 import { bootCell, callTool, shutdownCell } from './cell-loader.js';
 import { ManifestStore } from './manifest.js';
-import { NativeNeedleAgent, scoreTools, type AgentContext, type AgentTool } from './agent.js';
+import { NativeNeedleAgent, PermissionVeto, scoreTools, type AgentContext, type AgentTool, type CallPermit } from './agent.js';
 import { VERSION } from './version.js';
 import { classifyToolResult, degradationReasons } from './outcome.js';
 import {
@@ -188,13 +188,22 @@ export class HelaRuntime {
     return catalog;
   }
 
-  async executeAgentTool(tool: AgentTool, args: Record<string, unknown>): Promise<unknown> {
-    if (tool.cell === RUNTIME_UPDATE_CELL) return this.executeRuntimeUpdate(tool.name, args);
+  async executeAgentTool(tool: AgentTool, args: Record<string, unknown>, permits: CallPermit): Promise<unknown> {
+    const check = (realName: string, annotations: AgentTool['annotations']): void => {
+      if (!permits({ realName, annotations }, args)) throw new PermissionVeto(`Tool ${tool.name} is not permitted for this task`);
+    };
+    if (tool.cell === RUNTIME_UPDATE_CELL) {
+      check(tool.name, runtimeUpdateTools.find((candidate) => candidate.name === tool.name)?.annotations);
+      return this.executeRuntimeUpdate(tool.name, args);
+    }
     let cell = this.cells.get(tool.cell);
     if (!cell?.ready) cell = await this.ensureCell(tool.cell);
     if (!cell?.ready) throw new Error(`Cell not ready: ${tool.cell}`);
     const realName = this.toolToReal.get(tool.name) ?? tool.realName;
-    if (!cell.tools.has(realName)) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
+    const live = cell.tools.get(realName);
+    if (!live) throw new Error(`Tool ${tool.name} is not registered on ${tool.cell}`);
+    // The catalog may come from a cached manifest; the cell that is about to run the call has the last word.
+    check(realName, live.annotations);
     return this.invokeTool(tool.cell, realName, () => callTool(cell!, realName, args, this.options.toolTimeoutMs ?? 60000));
   }
 
