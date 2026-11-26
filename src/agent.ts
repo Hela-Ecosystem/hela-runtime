@@ -338,26 +338,52 @@ export function forbidsWrites(task: string): boolean {
 const WRITE_ACTION = {
   verbs: ['write', 'create', 'edit', 'patch', 'insert', 'update', 'save', 'set', 'apply'],
   request: /\b(write|create|save|make(?!\s+sure)|append|edit|add|insert|update|upgrade|patch|modify|change|overwrite|generate|set|configure|apply|remember|memorize|store|record|provision|fix|repair)\b/i,
+  forbidding: /\b(?:writ(?:e|es|ing)|creat\w*|edit\w*|modif\w*|chang(?:e|es|ing)|updat\w*|sav(?:e|es|ing)|append\w*|overwrit\w*|alter(?:ing)?|add(?:ing)?|insert\w*|remember\w*|stor(?:e|es|ing))\b/i,
 };
 const DELETE_ACTION = {
   verbs: ['delete', 'remove', 'drop', 'truncate', 'purge', 'prune', 'clear', 'reset', 'destroy'],
   request: /\b(delete|remove|erase|purge|prune|drop|truncate|clear|clean|wipe|reset|destroy|unlink|rm)\b/i,
+  forbidding: /\b(?:delet\w*|remov\w*|eras\w*|purg\w*|wip(?:e|es|ing)|drop(?:s|ping)?|truncat\w*|clear(?:ing)?|reset\w*|destroy\w*)\b/i,
 };
-const EXTRACT_ACTION = { verbs: [], request: /\b(extract|unzip|unpack|decompress|untar)\b/i };
-const MUTATIONS: Array<{ verbs: string[]; request: RegExp }> = [
+interface Mutation { verbs: string[]; request: RegExp; forbidding: RegExp }
+const EXTRACT_ACTION: Mutation = { verbs: [], request: /\b(extract|unzip|unpack|decompress|untar)\b/i, forbidding: /\b(?:extract\w*|unzip\w*|unpack\w*)\b/i };
+const MUTATIONS: Mutation[] = [
   WRITE_ACTION,
   DELETE_ACTION,
-  { verbs: ['move', 'rename'], request: /\b(move|rename|relocate|mv)\b/i },
-  { verbs: ['copy'], request: /\b(copy|duplicate|clone|back\s*up|cp)\b/i },
-  { verbs: ['kill', 'stop', 'close', 'terminate', 'cancel', 'signal'], request: /\b(kill|stop|close|terminate|cancel|signal|interrupt|abort|quit|shut\s*down)\b/i },
-  { verbs: ['install'], request: /\binstall\b/i },
-  { verbs: ['uninstall'], request: /\b(uninstall|remove)\b/i },
-  { verbs: ['import'], request: /\b(import|load|restore)\b/i },
-  { verbs: ['archive'], request: /\b(archive|compress|zip|tar|pack|back\s*up)\b/i },
-  { verbs: ['upload', 'push'], request: /\b(upload|push|send|transfer|attach)\b/i },
+  { verbs: ['move', 'rename'], request: /\b(move|rename|relocate|mv)\b/i, forbidding: /\b(?:mov(?:e|es|ing)|renam\w*)\b/i },
+  { verbs: ['copy'], request: /\b(copy|duplicate|clone|back\s*up|cp)\b/i, forbidding: /\b(?:cop(?:y|ies|ying)|duplicat\w*|clon(?:e|es|ing))\b/i },
+  {
+    verbs: ['kill', 'stop', 'close', 'terminate', 'cancel', 'signal'],
+    request: /\b(kill|stop|close|terminate|cancel|signal|interrupt|abort|quit|shut\s*down)\b/i,
+    forbidding: /\b(?:kill\w*|stop(?:s|ping)?|clos(?:e|es|ing)|terminat\w*|cancel\w*|signal\w*)\b/i,
+  },
+  { verbs: ['install'], request: /\binstall\b/i, forbidding: /\binstall\w*\b/i },
+  { verbs: ['uninstall'], request: /\b(uninstall|remove)\b/i, forbidding: /\b(?:uninstall\w*|remov\w*)\b/i },
+  { verbs: ['import'], request: /\b(import|load|restore)\b/i, forbidding: /\bimport\w*\b/i },
+  { verbs: ['archive'], request: /\b(archive|compress|zip|tar|pack|back\s*up)\b/i, forbidding: /\b(?:archiv\w*|compress\w*|zip\w*)\b/i },
+  { verbs: ['upload', 'push'], request: /\b(upload|push|send|transfer|attach)\b/i, forbidding: /\b(?:upload\w*|push\w*|send\w*)\b/i },
 ];
 
-function mutationsOf(toolName: string): Array<{ request: RegExp }> {
+/** Actions that are not visible in a tool's verbs: the wording that bans them, and the tools that perform them. */
+const INTERACTIONS: Array<{ forbidding: RegExp; tools: RegExp }> = [
+  {
+    forbidding: /\b(?:click\w*|tap(?:s|ping)?|interact\w*|select(?:ing)?)\b/i,
+    tools: /^(?:browser_(?:click|download_click|press|check|uncheck|select|select_by_index|drag|dialog|dismiss_popups|fill_form|batch_answer_quiz|solve_captcha_grid|handle_captcha|replay_macro|parallel_execute|evaluate)|tap|long_press|swipe|drag_drop|key_event|ui_tap_element|ui_smart_fill|form_fill)$/,
+  },
+  {
+    forbidding: /\b(?:typ(?:e|es|ing)|fill\w*|enter(?:ing)?|input\w*|interact\w*)\b/i,
+    tools: /^(?:browser_(?:type|clear|fill_form|batch_answer_quiz|replay_macro|parallel_execute|evaluate)|input_text|key_event|clipboard_set|ui_smart_fill|form_fill)$/,
+  },
+  {
+    forbidding: /\b(?:submit\w*|press\w*|send\w*|post(?:ing)?)\b/i,
+    tools: /^(?:browser_(?:press|click|download_click|fill_form|batch_answer_quiz|replay_macro|parallel_execute|evaluate)|tap|key_event|ui_tap_element|ui_smart_fill|form_fill)$/,
+  },
+  { forbidding: /\b(?:navigat\w*|visit\w*|brows(?:e|ing))\b/i, tools: /^browser_(?:navigate|search|new_tab|back|forward|reload)$/ },
+  { forbidding: /\b(?:screenshot\w*|captur\w*)\b/i, tools: /^(?:browser_)?screenshot$/ },
+  { forbidding: /\b(?:run(?:ning)?|execut\w*)\b/i, tools: /^(?:execute_command|execute_sql|execute_blender_code|shell_exec|session_spawn|session_write|agent_spawn)$/ },
+];
+
+function mutationsOf(toolName: string): Mutation[] {
   const name = toolName.toLowerCase();
   // "archive_org_search" and "hela.update.check" only look something up.
   if (/[_.](search|check)$/.test(name)) return [];
@@ -371,7 +397,6 @@ function isMutatingTool(toolName: string): boolean {
   return mutationsOf(toolName).length > 0;
 }
 
-const NEGATED_CLAUSE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n,;]*/gi;
 const OPENING_QUOTE = /(?<=^|\s)["'`]/g;
 const CLOSING_QUOTE = /["'`](?=$|[\s.,;:!?])/g;
 
@@ -399,9 +424,54 @@ function withoutQuoted(line: string): string {
   return kept + line.slice(from);
 }
 
+const NEGATOR = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid|refrain\s+from|no\s+need\s+to)\b/i;
+// A ban ends at a contrast, or at "and" opening a new request ("do not click Delete and take a screenshot").
+const NEGATION_BOUNDARY = /(,|\b(?:but|instead|however|then)\b|\band\b(?=\s+(?:also\s+)?(?:take|open|navigate|go|visit|tell|show|list|read|report|inspect|check|verify|search|find|capture|summari[sz]e)\b))/i;
+// Past a comma it continues only through a list: "do not click, type, or submit".
+const LIST_ITEM = /^\s*(?:(?:or|nor)\b|(?:and\s+)?[a-z]+(?:\s+(?:or|nor)\b|\s*$))/i;
+// Nothing banned yet, so the ban reaches over the comma: "do not, under any circumstances, delete".
+const NO_VERB_YET = /^\s*(?:(?:ever|under|at|for|in|on|please)\b.*)?$/i;
+
+/** Separates what a text asks for from what it bans. One pass over its sentences and clauses. */
+function splitNegations(text: string): { affirmative: string; negated: string[] } {
+  const negated: string[] = [];
+  const affirmative = text.split(/([.!?;\n])/).map((sentence) => {
+    let banning = false;
+    let awaitingVerb = false;
+    return sentence.split(NEGATION_BOUNDARY).map((part, index, parts) => {
+      if (index % 2) return part;
+      if (banning && parts[index - 1] === ',' && (awaitingVerb || LIST_ITEM.test(part))) {
+        negated[negated.length - 1] += `,${part}`;
+        awaitingVerb = awaitingVerb && NO_VERB_YET.test(part);
+        return ' ';
+      }
+      const found = part.match(NEGATOR);
+      banning = found !== null;
+      if (!found) return part;
+      const start = found.index ?? 0;
+      awaitingVerb = NO_VERB_YET.test(part.slice(start + found[0].length));
+      negated.push(part.slice(start));
+      return `${part.slice(0, start)} `;
+    }).join('');
+  }).join('');
+  return { affirmative, negated };
+}
+
+/** A text without its bans. */
+function affirmativeText(text: string): string {
+  return splitNegations(text).affirmative;
+}
+
+/** The wording of every banned action. A ban protecting only the task's own input bans no tool. */
+function bannedText(task: string): string {
+  return splitNegations(replacePaths(task, () => ' ')).negated
+    .filter((span) => !span.match(NEGATED_WRITE) || forbidsWrites(span))
+    .join('\n');
+}
+
 /** The task's own wording of what it wants: negated clauses removed, each path or filename replaced. */
 function requestedText(task: string, placeholder = ''): string {
-  return replacePaths(task, () => placeholder).replace(NEGATED_WRITE, ' ').replace(NEGATED_CLAUSE, ' ');
+  return affirmativeText(replacePaths(task, () => placeholder));
 }
 
 /** As requestedText, without quoted text: what the task itself says. */
@@ -409,7 +479,7 @@ function spokenText(task: string, placeholder = ''): string {
   return requestedText(task, placeholder).split('\n').map(withoutQuoted).join('\n');
 }
 
-function asksFor(task: string, mutations: Array<{ request: RegExp }>): boolean {
+function asksFor(task: string, mutations: Mutation[]): boolean {
   const spoken = spokenText(task);
   return mutations.some((mutation) => mutation.request.test(spoken));
 }
@@ -483,8 +553,8 @@ function hasReadOnlyArgs(toolName: string, args: Record<string, unknown>): boole
 }
 
 /**
- * The one permission check: planning, retrieval and dispatch all ask it. A write-banned or read-only task gets only
- * read-only tools. The single exception is a read-only task (no ban) that matches one of the runtime's own
+ * The one permission check: planning, retrieval and dispatch all ask it. A banned action ("do not click") is refused
+ * to every task. A write-banned or read-only task gets only read-only tools. The single exception is a read-only task (no ban) that matches one of the runtime's own
  * side-effect-free diagnostics: the shell may then run exactly that command and nothing else.
  */
 function taskGate(task: string) {
@@ -492,10 +562,14 @@ function taskGate(task: string) {
   const restricted = banned || isReadOnlyTask(task);
   const fixed = restricted && !banned ? runtimeCommand(task) : undefined;
   const diagnostic = fixed?.readOnly ? fixed.command : undefined;
+  const bans = bannedText(task);
+  const isBanned = (toolName: string) => mutationsOf(toolName).some((mutation) => mutation.forbidding.test(bans))
+    || INTERACTIONS.some((action) => action.tools.test(toolName) && action.forbidding.test(bans));
   return {
     restricted,
     /** Without args: may the tool be planned or offered. With args: may this call be dispatched. */
     permits(tool: GatedTool, args?: Record<string, unknown>): boolean {
+      if (isBanned(tool.realName)) return false;
       if (!restricted) return true;
       if (tool.realName === 'execute_command') {
         return diagnostic !== undefined && (!args
@@ -671,7 +745,7 @@ const RUNTIME_COMMANDS: Array<{ pattern: RegExp; command: string; readOnly: bool
 ];
 
 function runtimeCommand(task: string): { command: string; readOnly: boolean } | undefined {
-  const lower = maskPaths(task).toLowerCase();
+  const lower = affirmativeText(maskPaths(task)).toLowerCase();
   if (/\b(count|how many)\b.*\b(lines?|loc)\b/i.test(lower)) {
     const dir = mentionedDirectory(task) ?? '.';
     return { command: `find ${dir} -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mjs' \\) -print0 | xargs -0 wc -l | sort -n | tail -20`, readOnly: true };
@@ -725,7 +799,7 @@ function planFor(task: string, gate: TaskGate): PlannedStep[] {
 }
 
 function draftPlan(task: string, gate: TaskGate): PlannedStep[] {
-  const lower = maskPaths(task).toLowerCase();
+  const lower = affirmativeText(maskPaths(task)).toLowerCase();
   const steps: PlannedStep[] = [];
   const url = extractUrl(task);
   const domain = extractDomain(task);
@@ -1286,7 +1360,7 @@ export class NativeNeedleAgent {
       }
       shortlist = shortlist.filter((tool) => gate.permits(tool));
       if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
-      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted ? 'no permitted tools' : 'no relevant tools'; break; }
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted || (step && !gate.permits({ realName: step.tool })) ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
       // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file). A task

@@ -114,6 +114,51 @@ for (const flavour of FLAVOURS) {
     }
   });
 
+  const page = catalogOf(flavour, [
+    ['browser_navigate', 'Open a URL in the browser page.', { url: text }, ['url']],
+    ['browser_get_state', 'Inspect the current page settings.'],
+    ['browser_click', 'Click an element on the page. Delete settings.', { selector: text }],
+    ['browser_type', 'Type into a form on the page.', { text }],
+    ['browser_press', 'Press a key on the page to submit.', { key: text }],
+    ['browser_screenshot', 'Take a screenshot of the page.'],
+    ['delete_file', 'Delete a settings file on the page.', { path: text }],
+  ]);
+  const BANNED_BY = { browser_click: /click/i, browser_type: /typ/i, browser_press: /press|submit|click/i, delete_file: /delet|modify/i };
+  const ACTIONS = Object.keys(BANNED_BY);
+
+  for (const task of [
+    'Open https://example.test/settings and inspect the page. Do not click Delete. Do not modify any files.',
+    'Open https://example.test/settings and inspect the page. Do not click Delete.',
+    'Open https://example.test/settings and take a screenshot. Do not click, type, submit or delete anything.',
+    'Open https://example.test/settings and take a screenshot without clicking, typing, or submitting anything',
+    "Open https://example.test/settings. Don't click or type, and never press Enter.",
+    'Open https://example.test/settings. You should not, under any circumstances, delete or click anything.',
+  ]) {
+    for (const want of ACTIONS.filter((name) => BANNED_BY[name].test(task))) {
+      test(`gate (${flavour}): a banned ${want} is neither planned nor run: ${task}`, async () => {
+        const { ran, plan } = await run(page, task, want, { browser_navigate: { url: 'https://example.test/settings' } });
+        assert.ok(!plan.includes(want), `planned: ${plan}`);
+        assert.ok(!ran.includes(want), `ran: ${ran}`);
+        assert.equal(ran[0], 'browser_navigate');
+      });
+    }
+  }
+
+  test(`gate (${flavour}): a ban ends where the next request begins`, async () => {
+    const planOf = async (task) => (await run(page, task, 'browser_navigate')).plan;
+    assert.deepEqual(await planOf('Open https://example.test/a. Do not click Delete and take a screenshot'), ['browser_navigate', 'browser_screenshot']);
+    assert.deepEqual(await planOf('Open https://example.test/a, do not type anything, just click Next'), ['browser_navigate', 'browser_click']);
+    assert.deepEqual(await planOf('Open https://example.test/a, do not take a screenshot, and click Next'), ['browser_navigate', 'browser_click']);
+  });
+
+  test(`gate (${flavour}): many negations do not stall the gate`, () => {
+    for (const task of [`inspect ${"don't ".repeat(20000)}`, `inspect do not click${', type'.repeat(20000)}`]) {
+      const started = Date.now();
+      retrieveTools(page, task);
+      assert.ok(Date.now() - started < 5000, task.slice(0, 30));
+    }
+  });
+
   test(`gate (${flavour}): a question about deleting is not permission to delete`, async () => {
     const files = catalogOf(flavour, [['delete_file', 'Delete a file the app owns.', { path: text }], ['get_file_info', 'Get file metadata.', { path: text }]]);
     for (const task of ['Tell me which files the app can delete', 'Which files can I delete?', 'Inspect metadata for delete.md.']) {
