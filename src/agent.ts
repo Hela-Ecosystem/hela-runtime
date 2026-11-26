@@ -232,11 +232,13 @@ function expandQuery(tokens: string[]): string[] {
   return [...out];
 }
 
-// A quoted path (may contain spaces), or any word with a slash: paths and URLs name data, not actions.
-const PATH_TOKEN = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]*[/\\][^\s"'`<>()]*/g;
+// A quoted path (may contain spaces), else one word; words with a slash are paths or URLs: they name data, not
+// actions. Words are matched whole and filtered afterwards, which stays linear on long slash-free input.
+const QUOTED_PATH_OR_WORD = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]+/g;
 
 function replacePaths(text: string, placeholder: (value: string) => string): string {
-  return text.replace(PATH_TOKEN, (match: string) => {
+  return text.replace(QUOTED_PATH_OR_WORD, (match: string) => {
+    if (!/[/\\]/.test(match)) return match;
     const punctuation = match.match(/[.,;:!?]+$/)?.[0] ?? '';
     return ` ${placeholder(match.slice(0, match.length - punctuation.length))}${punctuation}`;
   });

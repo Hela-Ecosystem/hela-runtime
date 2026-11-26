@@ -133,3 +133,9 @@ test('RT-10: a memory lookup plans neither a write nor a web search; a memory wr
   assert.deepEqual(await plan('Remember that releases ship on Friday'), ['memory_edit']);
   assert.deepEqual(await plan('Add an observation: the build is green'), ['memory_edit']);
 });
+
+test('RT-10: a long slash-free word does not stall path matching', () => {
+  const started = Date.now();
+  names(`Inspect ${'a'.repeat(200000)}`);
+  assert.ok(Date.now() - started < 5000);
+});
