@@ -193,6 +193,32 @@ for (const flavour of FLAVOURS) {
     }
   });
 
+  test(`gate (${flavour}): a comma or semicolon glued to a path still separates clauses`, async () => {
+    const planOf = async (task) => (await run(page, task, 'browser_navigate')).plan;
+    for (const separator of [',', ';']) {
+      assert.deepEqual(await planOf(`Open https://example.test/a and compare /tmp/report.txt${separator}screenshot`), ['browser_navigate', 'browser_screenshot'], separator);
+    }
+    const offered = (task) => retrieveTools(page, task, [], 20).map((tool) => tool.realName);
+    // The request after the path is read: this task asks for a deletion, so it is not read-only.
+    assert.ok(offered('Inspect /tmp/settings/report.txt,delete the settings page file').includes('delete_file'));
+    // The path itself still names nothing.
+    assert.ok(!offered('Inspect the settings page in /tmp/delete,click/report.txt').includes('delete_file'));
+  });
+
+  test(`gate (${flavour}): a URL stays whole, so its tail is never an instruction`, () => {
+    for (const task of ['Inspect the settings page https://example.test/a,delete', 'Inspect the settings page https://example.test/a;delete?x=1,click', 'Inspect the settings page "/tmp/a b,delete the file"']) {
+      assert.deepEqual(retrieveTools(page, task, [], 20).map((tool) => tool.realName).filter((name) => ACTIONS.includes(name)), [], task);
+    }
+  });
+
+  test(`gate (${flavour}): long separator runs in a path stay fast`, () => {
+    for (const task of [`inspect ${'/a,'.repeat(100000)}`, `inspect a/${',;'.repeat(100000)}b`]) {
+      const started = Date.now();
+      retrieveTools(page, task);
+      assert.ok(Date.now() - started < 5000, task.slice(0, 30));
+    }
+  });
+
   test(`gate (${flavour}): a ban ends where the next request begins`, async () => {
     const planOf = async (task) => (await run(page, task, 'browser_navigate')).plan;
     assert.deepEqual(await planOf('Open https://example.test/a. Do not click Delete and take a screenshot'), ['browser_navigate', 'browser_screenshot']);

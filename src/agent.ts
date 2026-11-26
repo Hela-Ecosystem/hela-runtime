@@ -248,14 +248,22 @@ function expandQuery(tokens: string[]): string[] {
 const BARE_FILENAME = /\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|ini|cfg|conf|env|lock|log|bak|tmp|csv|tsv|js|mjs|cjs|ts|tsx|jsx|py|sh|bash|zsh|c|cc|cpp|h|hpp|rs|go|java|kt|php|rb|sql|db|sqlite|css|scss|html?|xml|pdf|png|jpe?g|webp|gif|svg|zip|tar|gz|blend|apk)$/i;
 const QUOTED_PATH_OR_WORD = /(["'`])(?:~|\.{1,2})?\/[^"'`\n]*\1|[^\s"'`<>()]+/g;
 
+/** The word, or its placeholder when it is a path, URL or filename; trailing punctuation stays. */
+function replaceIfPath(word: string, placeholder: (value: string) => string): string {
+  // Scanned backwards: an anchored /[.,;:!?]+$/ is quadratic on long punctuation runs.
+  let end = word.length;
+  while (end > 0 && '.,;:!?'.includes(word[end - 1])) end--;
+  const core = word.slice(0, end);
+  if (!/[/\\]/.test(core) && !BARE_FILENAME.test(core)) return word;
+  return ` ${placeholder(core)}${word.slice(end)}`;
+}
+
 function replacePaths(text: string, placeholder: (value: string) => string): string {
-  return text.replace(QUOTED_PATH_OR_WORD, (match: string) => {
-    // Scanned backwards: an anchored /[.,;:!?]+$/ is quadratic on long punctuation runs.
-    let end = match.length;
-    while (end > 0 && '.,;:!?'.includes(match[end - 1])) end--;
-    const core = match.slice(0, end);
-    if (!/[/\\]/.test(core) && !BARE_FILENAME.test(core)) return match;
-    return ` ${placeholder(core)}${match.slice(end)}`;
+  return text.replace(QUOTED_PATH_OR_WORD, (match: string, quote?: string) => {
+    // Quoted paths and URLs may hold "," and ";". In a bare path they end it and open the next clause
+    // ("/tmp/report.txt,verify"); a URL stays whole so its tail cannot read as an instruction.
+    if (quote || match.includes('://')) return replaceIfPath(match, placeholder);
+    return match.split(/([,;])/).map((piece, index) => (index % 2 ? piece : replaceIfPath(piece, placeholder))).join('');
   });
 }
 
