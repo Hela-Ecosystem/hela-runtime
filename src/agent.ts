@@ -849,11 +849,21 @@ function intentForTool(name: string): string {
   return 'other';
 }
 
-function planFor(task: string, gate: TaskGate): PlannedStep[] {
-  return draftPlan(task, gate).filter((step) => gate.permits({ realName: step.tool }));
+/**
+ * The catalog entry for a planned (cell) tool name: the exposed name first, since plans name tools as their cell does
+ * and a namespaced catalog exposes them under another name.
+ */
+function plannedTool(catalog: AgentTool[], name: string): AgentTool | undefined {
+  return catalog.find((tool) => tool.name === name) ?? catalog.find((tool) => tool.realName === name);
 }
 
-function draftPlan(task: string, gate: TaskGate): PlannedStep[] {
+function planFor(task: string, gate: TaskGate, catalog: AgentTool[]): PlannedStep[] {
+  // The same question run() asks, about the same descriptor and its hints. A tool the catalog lacks has only a name.
+  const allows = (name: string) => gate.permits(plannedTool(catalog, name) ?? { realName: name });
+  return draftPlan(task, allows).filter((step) => allows(step.tool));
+}
+
+function draftPlan(task: string, allows: (toolName: string) => boolean): PlannedStep[] {
   const lower = affirmativeText(maskPaths(task)).toLowerCase();
   const steps: PlannedStep[] = [];
   const url = extractUrl(task);
@@ -890,7 +900,7 @@ function draftPlan(task: string, gate: TaskGate): PlannedStep[] {
   }
   const localExplore = hasAny(lower, /\b(find|locate|count|inspect|measure)\b/)
     && hasAny(lower, /\b(files?|director(?:y|ies)|source|code|repo(?:sitory)?|runtime|packages?|typescript|\.ts|\.js|\.mjs)\b/);
-  if (!browser && (shellIntent || localExplore) && gate.permits({ realName: 'execute_command' })) {
+  if (!browser && (shellIntent || localExplore) && allows('execute_command')) {
     steps.push({ intent: 'shell', tool: 'execute_command', description: 'run the shell command for this task' });
     return steps;
   }
@@ -1375,7 +1385,7 @@ export class NativeNeedleAgent {
     const task = String(args.task ?? '').trim();
     if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const catalog = this.catalog();
-    const plan = planFor(task, taskGate(task));
+    const plan = planFor(task, taskGate(task), catalog);
     const retrieved = retrieveTools(catalog, task, [], Math.max(MAX_SHORTLIST, Number(args.limit) || MAX_SHORTLIST));
     return {
       ok: true,
@@ -1401,7 +1411,7 @@ export class NativeNeedleAgent {
     if (!health.ok) return { ok: false, status: 'failed', error: health.detail, health };
 
     const gate = taskGate(task);
-    const planned = planFor(task, gate);
+    const planned = planFor(task, gate, catalog);
     const known = new Map(catalog.map((tool) => [tool.name, tool]));
     const changeRequested = !gate.restricted && asksFor(task, [...MUTATIONS, EXTRACT_ACTION]);
     const history: HistoryStep[] = [];
@@ -1428,14 +1438,13 @@ export class NativeNeedleAgent {
 
       let shortlist: AgentTool[];
       if (step) {
-        // Plans name tools as their cell does; a namespaced catalog exposes them under another name.
-        const plannedTool = catalog.find((tool) => tool.name === step.tool) ?? catalog.find((tool) => tool.realName === step.tool);
+        const target = plannedTool(catalog, step.tool);
         // Keep the shortlist inside the step's intent family. Needle was
         // choosing write_file for a navigate step when the shortlist mixed
         // families, which executed the wrong action.
         const alternatives = retrieveTools(catalog, `${task} ${step.description}`, history, MAX_SHORTLIST * 3, gate)
           .filter((tool) => intentForTool(tool.realName) === step.intent || tool.realName === step.tool);
-        shortlist = [plannedTool, ...alternatives].filter((tool): tool is AgentTool => Boolean(tool))
+        shortlist = [target, ...alternatives].filter((tool): tool is AgentTool => Boolean(tool))
           .filter((tool, index, all) => all.findIndex((candidate) => candidate.name === tool.name) === index)
           .slice(0, MAX_SHORTLIST);
       } else {
@@ -1443,7 +1452,7 @@ export class NativeNeedleAgent {
       }
       shortlist = shortlist.filter((tool) => gate.permits(tool));
       if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
-      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted || (step && !gate.permits({ realName: step.tool })) ? 'no permitted tools' : 'no relevant tools'; break; }
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted || (step && !gate.permits(plannedTool(catalog, step.tool) ?? { realName: step.tool })) ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
       // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file) unless

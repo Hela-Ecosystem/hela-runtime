@@ -219,6 +219,34 @@ for (const flavour of FLAVOURS) {
     }
   });
 
+  test(`gate (${flavour}): the plan is gated on the catalog's own hints, and run() follows the same plan`, async () => {
+    const hinted = catalogOf(flavour, [
+      ['browser_navigate', 'Open a URL in the browser page.', { url: text }, ['url']],
+      ['browser_screenshot', 'Take a screenshot of the page.', {}, [], { destructiveHint: true }],
+      ['browser_type', 'Type into the page.', { text }, [], { readOnlyHint: true }],
+      ['browser_press', 'Press a key.', { key: text }],
+      ['browser_get_state', 'Inspect the page.'],
+      ['execute_command', 'Run a shell command.', { command: text }, ['command'], 'unreadable'],
+      ['read_file', 'Read a file.', { path: text }],
+    ]);
+    const expected = [
+      ['Open https://example.test/a and take a screenshot. Do not modify any files.', ['browser_navigate']],
+      // browser_type is not on the allow-list: only its published hint admits it.
+      ['Open https://example.test/a and search for cells. Do not modify any files.', ['browser_navigate', 'browser_type']],
+      ['Open https://example.test/a and take a screenshot', ['browser_navigate', 'browser_screenshot']],
+      ['Check disk usage', []],
+      ['Read notes.txt', ['read_file']],
+    ];
+    for (const [task, tools] of expected) {
+      const agent = new NativeNeedleAgent({ agentCatalog: () => hinted, agentContext: () => context, executeAgentTool: async () => envelope('ok') }, { root: assetRoot, profile: null });
+      agent.choose = async (shortlist) => shortlist[0].name;
+      agent.arguments = async () => ({ args: {} });
+      const planned = (await agent.plan({ task })).plan;
+      assert.deepEqual(planned.map((step) => step.tool), tools, task);
+      assert.deepEqual((await agent.run({ task, maxIterations: 4 })).plan, planned, task);
+    }
+  });
+
   test(`gate (${flavour}): a ban ends where the next request begins`, async () => {
     const planOf = async (task) => (await run(page, task, 'browser_navigate')).plan;
     assert.deepEqual(await planOf('Open https://example.test/a. Do not click Delete and take a screenshot'), ['browser_navigate', 'browser_screenshot']);
