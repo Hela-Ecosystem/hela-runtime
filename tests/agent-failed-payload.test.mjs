@@ -29,6 +29,9 @@ const EISDIR = envelope({ success: false, message: 'Failed to read file: EISDIR:
 
 // The live repro from runtime#4. Needle is stubbed: the loop, not the model, is under test.
 const TASK = 'Tell me the current time in Asia/Jakarta. Do not modify any files.';
+// A clock whose name shares no word with TASK, so the loop follows the stubbed picks instead of
+// opening with a name match (RT-08).
+const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? tool('clock_now', entry.description) : entry));
 function agentWith(executeAgentTool, picks, tools = catalog) {
   const host = { agentCatalog: () => tools, agentContext: () => ({ workspaceRoot: '/tmp/ws', cwd: '/tmp/cwd' }), executeAgentTool };
   const agent = new NativeNeedleAgent(host, { root: assetRoot, profile: null });
@@ -107,7 +110,7 @@ test('agent_plan: an ordinary write still plans write_file', async () => {
 });
 
 test('agent_run: a failed payload is a failed run, not "single action complete"', async () => {
-  const agent = agentWith(async () => EISDIR, ['read_file']);
+  const agent = agentWith(async () => EISDIR, ['read_file'], unnamedClock);
   const result = await agent.run({ task: TASK, maxIterations: 4, maxToolCalls: 3 });
   assert.equal(result.ok, false);
   assert.equal(result.status, 'failed');
@@ -124,13 +127,13 @@ test('agent_run: recovers when a later call succeeds, and says some calls failed
   const agent = agentWith(async (selected) => {
     seen.push(selected.name);
     return selected.name === 'read_file' ? EISDIR : envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T04:30:00+07:00' });
-  }, ['read_file', 'get_current_time']);
+  }, ['read_file', 'clock_now'], unnamedClock);
   const result = await agent.run({ task: TASK, maxIterations: 4, maxToolCalls: 3 });
-  assert.deepEqual(seen, ['read_file', 'get_current_time']);
+  assert.deepEqual(seen, ['read_file', 'clock_now']);
   assert.equal(result.ok, true);
   assert.equal(result.status, 'degraded');
   assert.equal(result.failedCalls, 1);
-  assert.match(result.decision.reason, /single action complete \(get_current_time\)/);
+  assert.match(result.decision.reason, /single action complete \(clock_now\)/);
 });
 
 test('agent_run: a clean success is unchanged', async () => {

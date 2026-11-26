@@ -142,13 +142,15 @@ const WATCHING = envelope({ success: true, message: 'Started watching /data/x' }
 const JAKARTA = envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T21:30:00+07:00' });
 
 test('RT-07: runtime#4 repro - a wrong-tool ok call is not "single action complete"', async () => {
+  // The clock's name shares no word with the task, so the RT-08 opening preference leaves Needle's pick alone.
+  const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? tool('clock_now', entry.description) : entry));
   const seen = [];
-  const agent = agentWith(async (selected) => { seen.push(selected.name); return selected.name === 'get_current_time' ? JAKARTA : WATCHING; }, ['watch_file', 'get_current_time']);
+  const agent = agentWith(async (selected) => { seen.push(selected.name); return selected.name === 'clock_now' ? JAKARTA : WATCHING; }, ['watch_file', 'clock_now'], unnamedClock);
   const result = await agent.run({ task: TIME_TASK, maxIterations: 5, maxToolCalls: 5 });
-  assert.deepEqual(seen, ['watch_file', 'get_current_time']);
+  assert.deepEqual(seen, ['watch_file', 'clock_now']);
   assert.equal(result.ok, true);
   assert.equal(result.status, 'ok');
-  assert.match(result.decision.reason, /single action complete \(get_current_time\)/);
+  assert.match(result.decision.reason, /single action complete \(clock_now\)/);
 });
 
 test('RT-07: runtime#4 repro - never answered ends degraded after trying the budget', async () => {
@@ -166,7 +168,8 @@ test('RT-07: runtime#4 repro - never answered ends degraded after trying the bud
 });
 
 test('RT-07: a result that echoes the task content counts as an answer', async () => {
-  const result = await agentWith(async () => envelope('It is 21:30 in Jakarta.'), ['watch_file']).run({ task: TIME_TASK, maxIterations: 3, maxToolCalls: 3 });
+  const withoutClock = catalog.filter((entry) => entry.name !== 'get_current_time');
+  const result = await agentWith(async () => envelope('It is 21:30 in Jakarta.'), ['watch_file'], withoutClock).run({ task: TIME_TASK, maxIterations: 3, maxToolCalls: 3 });
   assert.equal(result.status, 'ok');
   assert.equal(result.toolCalls, 1);
 });

@@ -367,12 +367,20 @@ function isMutatingTool(toolName: string): boolean {
 const NEGATED_CLAUSE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid)\b[^.!?\n,;]*/gi;
 const QUOTED_TEXT = /(^|\s)(["'`])[^\n]*?\2(?=$|[\s.,;:!?])/g;
 
+/** The task's own wording of what it wants: paths and negated clauses removed. */
+function requestedText(task: string): string {
+  return replacePaths(task, () => '').replace(NEGATED_WRITE, ' ').replace(NEGATED_CLAUSE, ' ');
+}
+
+function asksFor(task: string, mutations: Array<{ request: RegExp }>): boolean {
+  const requested = requestedText(task).replace(QUOTED_TEXT, ' ');
+  return mutations.some((mutation) => mutation.request.test(requested));
+}
+
 /** A mutating tool is eligible only when the task itself asks for its action: not in a path, quote or negation. */
 function taskAllows(toolName: string, task: string): boolean {
   const mutations = mutationsOf(toolName);
-  if (!mutations.length) return true;
-  const requested = withoutPaths(task).replace(NEGATED_WRITE, ' ').replace(NEGATED_CLAUSE, ' ').replace(QUOTED_TEXT, ' ');
-  return mutations.some((mutation) => mutation.request.test(requested));
+  return !mutations.length || asksFor(task, mutations);
 }
 
 const MAX_TRANSIENT_RETRIES = 1;
@@ -381,6 +389,25 @@ const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|ep
 /** Only a non-mutating tool failing with a timeout-like error is worth one more attempt. */
 function isTransientReadFailure(tool: AgentTool, error: string): boolean {
   return !isMutatingTool(tool.realName) && TRANSIENT_ERROR.test(error);
+}
+
+/** How many task words a tool carries in its name, and in its description. */
+function intentMatch(tool: AgentTool, task: string): { name: number; description: number } {
+  const words = [...new Set(tokenize(requestedText(task)))];
+  const count = (text: string) => {
+    const tokens = new Set(tokenize(text));
+    return words.filter((word) => tokens.has(word)).length;
+  };
+  return { name: count(tool.realName.replace(/_/g, ' ')), description: count(tool.description ?? '') };
+}
+
+/** The read-only tool whose name matches the task best; the description breaks ties, then retrieval order. */
+function bestIntentMatch(shortlist: AgentTool[], task: string): { tool: AgentTool; name: number } | undefined {
+  return shortlist
+    .filter((tool) => !isMutatingTool(tool.realName))
+    .map((tool) => ({ tool, ...intentMatch(tool, task) }))
+    .filter((match) => match.name > 0)
+    .sort((a, b) => b.name - a.name || b.description - a.description)[0];
 }
 
 /**
@@ -1121,6 +1148,10 @@ export class NativeNeedleAgent {
       if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly || (step && !taskAllows(step.tool, task)) ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
+      // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file). A task
+      // asking for a change is left to Needle: a read-only name match would pass as done without changing anything.
+      const lookup = !planned.length && !history.length && !asksFor(task, [...MUTATIONS, EXTRACT_ACTION]);
+      const opening = lookup ? bestIntentMatch(shortlist, task) : undefined;
 
       let chosenName: string | undefined;
       try {
@@ -1130,8 +1161,8 @@ export class NativeNeedleAgent {
       }
 
       if (chosenName === DONE_TOOL) {
-        if (step) {
-          chosenName = preferred?.name;
+        if (step || opening) {
+          chosenName = preferred?.name ?? opening?.tool.name;
         } else {
           decision = 'needle reported done';
           break;
@@ -1143,6 +1174,10 @@ export class NativeNeedleAgent {
         // Needle's disagreement, then execute the required step.
         notes.push(`step '${step.intent}': needle chose ${chosen.name}, executing ${preferred.name}`);
         chosen = preferred;
+      }
+      if (opening && chosen && opening.name > intentMatch(chosen, task).name) {
+        notes.push(`needle chose ${chosen.name}, executing ${opening.tool.name}: its name matches the task better`);
+        chosen = opening.tool;
       }
       if (!chosen) { decision = 'no tool selected'; break; }
 

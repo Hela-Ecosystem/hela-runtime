@@ -139,3 +139,60 @@ test('RT-10: a long slash-free word does not stall path matching', () => {
   names(`Inspect ${'a'.repeat(200000)}`);
   assert.ok(Date.now() - started < 5000);
 });
+
+// hela-runtime#4: get_current_time is retrieved, yet Needle opens with watch_file.
+const clock = [
+  namespaced('membrane', 'watch_file', 'Watch file or directory for changes.', { path: text }),
+  namespaced('membrane', 'read_file', 'Read a file from disk.', { path: text }),
+  namespaced('mitosis', 'convert_time', 'Convert time between timezones', { time: text }),
+  namespaced('mitosis', 'get_current_time', 'Get current time in a specific timezone', { timezone: text }),
+  namespaced('receptor', 'app_current', 'Get the app currently in the foreground.', {}),
+];
+const NOW = envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T21:30:00+07:00' });
+
+for (const task of ['Tell me the current time in Asia/Jakarta', 'Tell me the current time in Asia/Jakarta. Do not modify any files.']) {
+  for (const choice of ['hela_membrane_watch_file', 'hela_mitosis_convert_time', 'done', undefined]) {
+    test(`RT-08: get_current_time is tried first when Needle answers ${choice}: ${task}`, async () => {
+      const seen = [];
+      const agent = agentWith(clock, async (tool) => { seen.push(tool.realName); return NOW; }, () => choice);
+      const result = await agent.run({ task, maxIterations: 4, maxToolCalls: 3 });
+      assert.deepEqual(seen, ['get_current_time'], JSON.stringify(result.notes));
+      assert.equal(result.status, 'ok');
+      assert.match(result.decision.reason, /single action complete \(hela_mitosis_get_current_time\)/);
+    });
+  }
+}
+
+test('RT-08: the preference only opens the run, so Needle can move on after a failure', async () => {
+  const seen = [];
+  const agent = agentWith(clock, async (tool) => {
+    seen.push(tool.realName);
+    return tool.realName === 'convert_time' ? NOW : envelope({ success: false, error: 'bad timezone' });
+  }, () => 'hela_mitosis_convert_time');
+  const result = await agent.run({ task: 'Tell me the current time in Asia/Jakarta', maxIterations: 4, maxToolCalls: 3 });
+  assert.deepEqual(seen, ['get_current_time', 'convert_time']);
+  assert.equal(result.status, 'degraded');
+});
+
+test('RT-08: the preference never switches Needle to a mutating tool', async () => {
+  const tools = [namespaced('membrane', 'delete_file', 'Delete a file.', {}), namespaced('membrane', 'get_file_info', 'Get metadata.', {})];
+  const seen = [];
+  const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('delete file done'); }, () => 'hela_membrane_get_file_info');
+  await agent.run({ task: 'Delete the stale file', maxIterations: 1 });
+  assert.deepEqual(seen, ['get_file_info']);
+});
+
+for (const choice of ['hela_ribosome_session_signal', undefined, 'done']) {
+  test(`RT-08: a task asking for a change is never swapped for a read-only name match (${choice})`, async () => {
+    const tools = [
+      namespaced('ribosome', 'session_signal', 'Kill or signal a session process.', {}),
+      namespaced('ribosome', 'opencode_status', 'Show opencode server status.', {}),
+    ];
+    const seen = [];
+    const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('opencode server'); }, () => choice);
+    const result = await agent.run({ task: 'Kill the opencode server', maxIterations: 1 });
+    assert.ok(!result.notes.some((note) => /matches the task better/.test(note)), JSON.stringify(result.notes));
+    if (choice === 'hela_ribosome_session_signal') assert.deepEqual(seen, ['session_signal']);
+    if (choice === 'done') assert.deepEqual(seen, []);
+  });
+}
