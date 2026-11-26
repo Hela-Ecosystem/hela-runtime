@@ -241,7 +241,7 @@ interface ScoredDoc {
 
 function buildDocs(tools: AgentTool[]): ScoredDoc[] {
   return tools.map((tool) => {
-    const name = tool.name.replace(/_/g, ' ');
+    const name = tool.realName.replace(/_/g, ' ');
     const text = `${name} ${name} ${tool.description ?? ''} ${JSON.stringify(tool.inputSchema?.properties ?? {})}`;
     const tf = new Map<string, number>();
     for (const token of tokenize(text)) tf.set(token, (tf.get(token) ?? 0) + 1);
@@ -273,7 +273,7 @@ function scoreDocs(docs: ScoredDoc[], task: string, queryExtra = ''): Array<{ to
       if (doc.nameTokens.has(token)) score += idf * 1.8;
     }
     for (const rule of INTENT_BOOSTS) {
-      if (rule.pattern.test(lowerTask) && rule.names.includes(doc.tool.name)) score += rule.boost;
+      if (rule.pattern.test(lowerTask) && rule.names.includes(doc.tool.realName)) score += rule.boost;
     }
     return { tool: doc.tool, score };
   });
@@ -302,8 +302,8 @@ const MAX_TRANSIENT_RETRIES = 1;
 const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
 
 /** Only a non-mutating tool failing with a timeout-like error is worth one more attempt. */
-function isTransientReadFailure(toolName: string, error: string): boolean {
-  return !MUTATING_TOOL.test(toolName) && TRANSIENT_ERROR.test(error);
+function isTransientReadFailure(tool: AgentTool, error: string): boolean {
+  return !MUTATING_TOOL.test(tool.realName) && TRANSIENT_ERROR.test(error);
 }
 
 /**
@@ -313,7 +313,7 @@ function isTransientReadFailure(toolName: string, error: string): boolean {
 export function addressesTask(tool: AgentTool, task: string, resultText: string): boolean {
   const subject = task.replace(NEGATED_WRITE, ' ');
   const query = new Set(expandQuery(tokenize(subject)));
-  if (tokenize(tool.name.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
+  if (tokenize(tool.realName.replace(/_/g, ' ')).some((token) => query.has(token))) return true;
   const result = resultText.toLowerCase();
   return tokenize(subject).some((token) => token.length >= 4 && result.includes(token));
 }
@@ -325,13 +325,14 @@ export function addressesTask(tool: AgentTool, task: string, resultText: string)
  */
 export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[] {
   if (!forbidsWrites(task)) return tools;
-  const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.name));
+  const safe = tools.filter((tool) => !MUTATING_TOOL.test(tool.realName));
   return safe.length ? safe : tools;
 }
 
 export function retrieveTools(tools: AgentTool[], task: string, history: HistoryStep[] = [], limit = MAX_SHORTLIST): AgentTool[] {
   const last = [...history].reverse().find((step) => step.ok && step.result);
-  const queryExtra = last ? `${last.tool} ${last.result?.slice(0, 500) ?? ''}` : '';
+  const lastName = tools.find((tool) => tool.name === last?.tool)?.realName ?? last?.tool;
+  const queryExtra = last ? `${lastName} ${last.result?.slice(0, 500) ?? ''}` : '';
   const ranked = scoreTools(tools, task, queryExtra).map((entry) => entry.tool);
   return avoidMutatingTools(ranked, task).slice(0, limit);
 }
@@ -641,7 +642,7 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
   const searchTerm = extractSearchTerm(task);
   const expected = extractExpectedText(task);
   const lower = task.toLowerCase();
-  const byName = tool.name;
+  const byName = tool.realName;
 
   if (byName === 'execute_command') {
     delete args.host;
@@ -809,7 +810,7 @@ function resolveSystemPath(root: string, profile: string | null): string | undef
 }
 
 function plannerDescription(tool: AgentTool): string {
-  return PLANNER_HINTS[tool.name] ?? tool.description ?? tool.name;
+  return PLANNER_HINTS[tool.realName] ?? tool.description ?? tool.name;
 }
 
 /**
@@ -950,7 +951,7 @@ export class NativeNeedleAgent {
       academic_search: 'Provide the search query.',
       wikipedia_search: 'Provide the search query.',
     };
-    const description = `${plannerDescription(tool)}${hint[tool.name] ? ` ${hint[tool.name]}` : ''}`;
+    const description = `${plannerDescription(tool)}${hint[tool.realName] ? ` ${hint[tool.realName]}` : ''}`;
     const historyText = history.slice(-4).map((entry) => `${entry.tool}(${JSON.stringify(entry.args)}) -> ${entry.ok ? (entry.result ?? '').slice(0, 400) : `ERROR ${entry.error ?? ''}`}`).join('\n');
     const prompt = [
       `Task: ${task}`,
@@ -1011,8 +1012,8 @@ export class NativeNeedleAgent {
     const unanswered = new Set<string>();
     const degradedReasons: string[] = [];
     const failedCalls = new Map<string, { error: string; retries: number; transient: boolean }>();
-    const recordFailure = (key: string, toolName: string, error: string) => {
-      failedCalls.set(key, { error, retries: failedCalls.get(key)?.retries ?? 0, transient: isTransientReadFailure(toolName, error) });
+    const recordFailure = (key: string, tool: AgentTool, error: string) => {
+      failedCalls.set(key, { error, retries: failedCalls.get(key)?.retries ?? 0, transient: isTransientReadFailure(tool, error) });
     };
 
     while (iterations < maxIterations && toolCalls < maxToolCalls && Date.now() - started < maxExecutionMs) {
@@ -1022,22 +1023,23 @@ export class NativeNeedleAgent {
 
       let shortlist: AgentTool[];
       if (step) {
-        const plannedTool = catalog.find((tool) => tool.name === step.tool);
+        // Plans name tools as their cell does; a namespaced catalog exposes them under another name.
+        const plannedTool = catalog.find((tool) => tool.name === step.tool) ?? catalog.find((tool) => tool.realName === step.tool);
         // Keep the shortlist inside the step's intent family. Needle was
         // choosing write_file for a navigate step when the shortlist mixed
         // families, which executed the wrong action.
         const alternatives = retrieveTools(catalog, `${task} ${step.description}`, history, MAX_SHORTLIST * 3)
-          .filter((tool) => intentForTool(tool.name) === step.intent || tool.name === step.tool);
+          .filter((tool) => intentForTool(tool.realName) === step.intent || tool.realName === step.tool);
         shortlist = [plannedTool, ...alternatives].filter((tool): tool is AgentTool => Boolean(tool))
           .filter((tool, index, all) => all.findIndex((candidate) => candidate.name === tool.name) === index)
           .slice(0, MAX_SHORTLIST);
       } else {
         shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST);
       }
-      if (readOnly) shortlist = shortlist.filter((tool) => !MUTATING_TOOL.test(tool.name));
+      if (readOnly) shortlist = shortlist.filter((tool) => !MUTATING_TOOL.test(tool.realName));
       if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
       if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly ? 'no permitted tools' : 'no relevant tools'; break; }
-      const preferred = shortlist.find((tool) => tool.name === step?.tool);
+      const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
 
       let chosenName: string | undefined;
@@ -1068,13 +1070,13 @@ export class NativeNeedleAgent {
       try {
         generated = await this.arguments(chosen, task, step, history);
       } catch (error) {
-        history.push({ iteration: iterations, intent: intentForTool(chosen.name), tool: chosen.name, args: {}, ok: false, error: error instanceof Error ? error.message : String(error), ms: 0 });
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: {}, ok: false, error: error instanceof Error ? error.message : String(error), ms: 0 });
         continue;
       }
       const repaired = repairArgs(chosen, generated.args, task, history, this.host.agentContext());
       const validation = validateArgs(chosen, repaired.args);
       if (!validation.ok) {
-        history.push({ iteration: iterations, intent: intentForTool(chosen.name), tool: chosen.name, args: repaired.args, ok: false, error: `${validation.error}; repairs=${repaired.repairs.join(', ')}`, ms: 0 });
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: repaired.args, ok: false, error: `${validation.error}; repairs=${repaired.repairs.join(', ')}`, ms: 0 });
         continue;
       }
 
@@ -1100,7 +1102,7 @@ export class NativeNeedleAgent {
         const outcome = classifyToolResult(result);
         history.push({
           iteration: iterations,
-          intent: intentForTool(chosen.name),
+          intent: intentForTool(chosen.realName),
           tool: chosen.name,
           args: repaired.args,
           ok: outcome.ok,
@@ -1111,7 +1113,7 @@ export class NativeNeedleAgent {
         lastCallOk = outcome.ok;
         if (!outcome.ok) {
           failedCount++;
-          recordFailure(callKey, chosen.name, outcome.error ?? 'failed');
+          recordFailure(callKey, chosen, outcome.error ?? 'failed');
           continue;
         }
         succeeded++;
@@ -1132,7 +1134,7 @@ export class NativeNeedleAgent {
         const message = error instanceof Error ? error.message : String(error);
         history.push({
           iteration: iterations,
-          intent: intentForTool(chosen.name),
+          intent: intentForTool(chosen.realName),
           tool: chosen.name,
           args: repaired.args,
           ok: false,
@@ -1141,7 +1143,7 @@ export class NativeNeedleAgent {
         });
         lastCallOk = false;
         failedCount++;
-        recordFailure(callKey, chosen.name, message);
+        recordFailure(callKey, chosen, message);
       }
     }
 
