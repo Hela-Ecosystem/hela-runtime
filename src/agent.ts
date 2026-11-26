@@ -625,9 +625,10 @@ function bestIntentMatch(shortlist: AgentTool[], task: string): { tool: AgentToo
 /** Whether a successful call could have made the change an unplanned task asks for. A lookup never does. */
 function performsChange(tool: AgentTool, task: string, resultText: string): boolean {
   if (isReadOnlyTool(tool)) return false;
-  if (mutationsOf(tool.realName).some((mutation) => asksFor(task, [mutation]))) return true;
-  // Shells and page interactions can change anything; they count when the result speaks to the task.
-  return INTERACTIONS.some((action) => action.tools.test(tool.realName)) && addressesTask(tool, task, resultText);
+  const mutations = mutationsOf(tool.realName);
+  if (mutations.length) return mutations.some((mutation) => asksFor(task, [mutation]));
+  // A name with no change verb (a shell, a click, "cache") may change anything: it counts when its result speaks to the task.
+  return addressesTask(tool, task, resultText);
 }
 
 /**

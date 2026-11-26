@@ -118,28 +118,35 @@ for (const [flavour, shape] of FLAVOURS) {
   });
 }
 
-test('RT-10: a task that asks for a change keeps the tools that perform it', () => {
-  assert.ok(names('Delete the opencode session abc123').includes('opencode_session_delete'));
-  assert.ok(names('Uninstall the app and its files').includes('app_uninstall'));
-  assert.ok(names('Stop the app and inspect metadata').includes('app_stop'));
-  assert.ok(names('Move the metadata file /tmp/a.md to /tmp/b.md').includes('move_file'));
-  assert.ok(names('Search archive metadata').includes('archive_org_search'));
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-10 (${flavour}): a task that asks for a change keeps the tools that perform it`, () => {
+    const tools = shape(risky);
+    assert.ok(names('Delete the opencode session abc123', tools).includes('opencode_session_delete'));
+    assert.ok(names('Uninstall the app and its files', tools).includes('app_uninstall'));
+    assert.ok(names('Stop the app and inspect metadata', tools).includes('app_stop'));
+    assert.ok(names('Move the metadata file /tmp/a.md to /tmp/b.md', tools).includes('move_file'));
+    assert.ok(names('Search archive metadata', tools).includes('archive_org_search'));
+  });
+}
 
-test('RT-10: verbs inside a path do not plan a shell or write step', async () => {
-  const agent = agentWith(files, async () => envelope('notes'), (list) => list[0]);
-  for (const task of ['Read /srv/build/test/notes.md', 'Read /home/user/save/notes.md']) {
-    assert.deepEqual((await agent.plan({ task })).plan.map((step) => step.tool), ['read_file'], task);
-  }
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-10 (${flavour}): verbs inside a path do not plan a shell or write step`, async () => {
+    const agent = agentWith(shape(files), async () => envelope('notes'), (list) => list[0]);
+    for (const task of ['Read /srv/build/test/notes.md', 'Read /home/user/save/notes.md']) {
+      assert.deepEqual((await agent.plan({ task })).plan.map((step) => step.tool), ['read_file'], task);
+    }
+  });
+}
 
-test('RT-10: a memory lookup plans neither a write nor a web search; a memory write still plans', async () => {
-  const agent = agentWith(files, async () => envelope('ok'), (list) => list[0]);
-  const plan = async (task) => (await agent.plan({ task })).plan.map((step) => step.tool);
-  assert.deepEqual(await plan('Search the knowledge graph for release notes'), []);
-  assert.deepEqual(await plan('Remember that releases ship on Friday'), ['memory_edit']);
-  assert.deepEqual(await plan('Add an observation: the build is green'), ['memory_edit']);
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-10 (${flavour}): a memory lookup plans neither a write nor a web search; a memory write still plans`, async () => {
+    const agent = agentWith(shape(files), async () => envelope('ok'), (list) => list[0]);
+    const plan = async (task) => (await agent.plan({ task })).plan.map((step) => step.tool);
+    assert.deepEqual(await plan('Search the knowledge graph for release notes'), []);
+    assert.deepEqual(await plan('Remember that releases ship on Friday'), ['memory_edit']);
+    assert.deepEqual(await plan('Add an observation: the build is green'), ['memory_edit']);
+  });
+}
 
 test('RT-10: a long slash-free word does not stall path matching', () => {
   const started = Date.now();
@@ -155,11 +162,13 @@ test('RT-10: unclosed quotes and punctuation runs do not stall the gate', () => 
   }
 });
 
-test('RT-10: an unclosed quote hides nothing, a closed one only its own span', () => {
-  assert.ok(names('Please "inspect, then delete the opencode session').includes('opencode_session_delete'));
-  assert.ok(names('Inspect "the notes" then delete the opencode session').includes('opencode_session_delete'));
-  assert.ok(!names("Inspect the opencode session named 'delete me'.").includes('opencode_session_delete'));
-});
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-10 (${flavour}): an unclosed quote hides nothing, a closed one only its own span`, () => {
+    assert.ok(names('Please "inspect, then delete the opencode session', shape(risky)).includes('opencode_session_delete'));
+    assert.ok(names('Inspect "the notes" then delete the opencode session', shape(risky)).includes('opencode_session_delete'));
+    assert.ok(!names("Inspect the opencode session named 'delete me'.", shape(risky)).includes('opencode_session_delete'));
+  });
+}
 
 for (const [flavour, shape] of FLAVOURS) {
   test(`RT-10 (${flavour}): a bare filename is data, not an action`, async () => {
@@ -282,5 +291,16 @@ for (const [flavour, shape] of FLAVOURS) {
     const agent = agentWith(lookups, async (tool) => { seen.push(tool.realName); return envelope('metadata'); }, (list) => list.find((name) => name.endsWith('read_file')));
     await agent.run({ task: 'Inspect metadata for /tmp/opencode/definitely-missing.md', maxIterations: 1 });
     assert.deepEqual(seen, ['read_file']);
+  });
+}
+
+for (const [flavour, shape] of FLAVOURS) {
+  test(`RT-08 (${flavour}): a change made by a tool without a change verb in its name completes the task`, async () => {
+    const tools = shape([namespaced('genome', 'cache', 'Get, set or clear cache entries.', {}), namespaced('genome', 'read_graph', 'Read the cache graph.', {})]);
+    const seen = [];
+    const agent = agentWith(tools, async (tool) => { seen.push(tool.realName); return envelope('cache cleared'); }, (list) => list.find((name) => name.endsWith('cache')));
+    const result = await agent.run({ task: 'Clear the cache', maxIterations: 4, maxToolCalls: 3 });
+    assert.deepEqual(seen, ['cache']);
+    assert.equal(result.status, 'ok', JSON.stringify(result.decision));
   });
 }
