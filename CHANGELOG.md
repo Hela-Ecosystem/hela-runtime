@@ -1,17 +1,17 @@
 ## [1.4.5] - 2026-11-27
 
 ### Security
-- One permission gate now covers retrieval, planning and dispatch in `hela.agent.run`. A task that bans writes, or only asks to find something out, gets read-only tools only (published `readOnlyHint`/`destructiveHint`, else an explicit allow-list; unknown tools are refused). A banned action ("do not click") is refused on every task. Before this release, with canonical tool names, "Inspect the repository configuration. Do not modify any files." could run a model-written shell command, and "Do not click Delete" could still click it.
+- One permission gate now covers retrieval, planning and dispatch in `hela.agent.run`. A task that bans writes, or only asks to find something out, is restricted to read-only tools: a tool is accepted through a published `readOnlyHint: true` or the explicit allow-list, and in either case only with no veto (`destructiveHint: true`, `readOnlyHint: false`, malformed annotations, a change verb in the tool name, or an action the task bans). Everything else is refused, apart from the pinned shell diagnostic described under Behaviour changes. A banned action ("do not click") is refused on every task. Before this release, with canonical tool names, "Inspect the repository configuration. Do not modify any files." could run a model-written shell command, and "Do not click Delete" could still click it.
 - Paths, URLs and bare filenames are treated as data, not intent, so `/tmp/opencode/...` or `delete.md` no longer pull destructive tools into the shortlist (#9).
 
 ### Fixed
 - Namespaced catalogs (the default) work: planning, intent matching, hints, boosts and argument repair use the cell tool name, execution uses the exposed name, and the model is shown cell tool names, so its picks no longer depend on the naming mode (#8).
 - A time question opens with the read-only tool that names it when the model's pick shares no word with the task (#4).
-- A lookup is no longer reported as having made the change a task asked for.
-- `hela.catalog.search` and `hela.catalog.list` match the cell name as well as the tool name and read the query literally.
+- In runs without a deterministic plan, a lookup is no longer reported as having made the change a task asked for. Planned runs are not checked this way.
+- `hela.catalog.search` and `hela.catalog.list` match the cell name as well as the tool name. Queries are searched as written, with no path stripping and no task-intent boosts; words are still split, filtered for stop words, singularised and widened with synonyms.
 
 ### Behaviour changes
-- Any write or action ban closes the shell: "Check disk usage. Do not modify any files." now fails. Without a ban, a read-only task may run only the runtime's own pinned diagnostic, with model arguments stripped.
+- Any ban on writing or deleting, or on running commands, closes the shell: "Check disk usage. Do not modify any files." now fails. Unrelated bans such as "do not click" do not close it. With no such ban, a read-only task may run only the runtime's own pinned diagnostic, with model arguments stripped.
 - "Check that npm test passes" counts as a lookup and no longer runs the tests.
 - Memory lookups no longer plan `memory_edit`.
 - Cell tool annotations are passed through to the agent catalog.
