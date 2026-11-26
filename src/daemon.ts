@@ -93,6 +93,7 @@ const runtimeUpdateTools: AgentTool[] = [
     realName: UPDATE_CHECK_TOOL,
     description: 'Read-only check for a newer HeLa ecosystem snapshot. Reports changed cells and never modifies the installation.',
     inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true },
   },
   {
     name: UPDATE_APPLY_TOOL,
@@ -105,6 +106,7 @@ const runtimeUpdateTools: AgentTool[] = [
       required: ['confirm'],
       additionalProperties: false,
     },
+    annotations: { destructiveHint: true },
   },
 ];
 
@@ -137,7 +139,7 @@ export class HelaRuntime {
   lazyCells = new Set<string>();
   server: Server;
   restartAttempts = new Map<string, number>();
-  cachedManifest: Record<string, Array<{ name: string; description?: string; inputSchema: any }>> = {};
+  cachedManifest: Record<string, Array<{ name: string; description?: string; inputSchema: any; annotations?: AgentTool['annotations'] }>> = {};
   booting = new Set<string>();
   private bootTasks = new Map<string, Promise<void>>();
   private restartTimers = new Map<string, NodeJS.Timeout>();
@@ -180,7 +182,7 @@ export class HelaRuntime {
           || excludedAgentCatalogToolNames.has(tool.name)
           || excludedAgentCatalogToolPatterns.some((pattern) => pattern.test(exposed) || pattern.test(tool.name))) continue;
         seen.add(exposed);
-        catalog.push({ name: exposed, cell: cellKey, realName: tool.name, description: tool.description, inputSchema: tool.inputSchema });
+        catalog.push({ name: exposed, cell: cellKey, realName: tool.name, description: tool.description, inputSchema: tool.inputSchema, annotations: tool.annotations });
       }
     }
     return catalog;

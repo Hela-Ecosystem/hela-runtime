@@ -16,6 +16,7 @@ export interface ToolDescriptor {
   name: string;
   description?: string;
   inputSchema: { type: 'object'; [key: string]: unknown };
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
 export interface CellHandle {

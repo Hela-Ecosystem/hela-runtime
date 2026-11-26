@@ -143,7 +143,8 @@ const JAKARTA = envelope({ timezone: 'Asia/Jakarta', datetime: '2026-11-25T21:30
 
 test('RT-07: runtime#4 repro - a wrong-tool ok call is not "single action complete"', async () => {
   // The clock's name shares no word with the task, so the RT-08 opening preference leaves Needle's pick alone.
-  const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? tool('clock_now', entry.description) : entry));
+  const clockNow = (entry) => ({ ...tool('clock_now', entry.description), annotations: { readOnlyHint: true } });
+  const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? clockNow(entry) : entry));
   const seen = [];
   const agent = agentWith(async (selected) => { seen.push(selected.name); return selected.name === 'clock_now' ? JAKARTA : WATCHING; }, ['watch_file', 'clock_now'], unnamedClock);
   const result = await agent.run({ task: TIME_TASK, maxIterations: 5, maxToolCalls: 5 });

@@ -8,6 +8,7 @@ export interface ToolDefinition {
   name: string;
   description?: string;
   inputSchema: { type: 'object'; [key: string]: unknown };
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
 export function validTools(value: unknown): value is ToolDefinition[] {

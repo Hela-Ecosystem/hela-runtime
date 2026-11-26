@@ -33,6 +33,8 @@ export interface AgentTool {
   realName: string;
   description?: string;
   inputSchema: any;
+  /** The cell's own MCP hints about the tool's effects, where it publishes them. */
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
 export interface AgentContext {
@@ -335,7 +337,7 @@ export function forbidsWrites(task: string): boolean {
 /** Verbs in a tool name that change state, each with the wording by which a task asks for that change. */
 const WRITE_ACTION = {
   verbs: ['write', 'create', 'edit', 'patch', 'insert', 'update', 'save', 'set', 'apply'],
-  request: /\b(write|create|save|make(?!\s+sure)|append|edit|add|insert|update|upgrade|patch|modify|change|overwrite|generate|set|configure|apply|remember|memorize|store|record)\b/i,
+  request: /\b(write|create|save|make(?!\s+sure)|append|edit|add|insert|update|upgrade|patch|modify|change|overwrite|generate|set|configure|apply|remember|memorize|store|record|provision|fix|repair)\b/i,
 };
 const DELETE_ACTION = {
   verbs: ['delete', 'remove', 'drop', 'truncate', 'purge', 'prune', 'clear', 'reset', 'destroy'],
@@ -397,21 +399,114 @@ function withoutQuoted(line: string): string {
   return kept + line.slice(from);
 }
 
-/** The task's own wording of what it wants: paths and negated clauses removed. */
-function requestedText(task: string): string {
-  return replacePaths(task, () => '').replace(NEGATED_WRITE, ' ').replace(NEGATED_CLAUSE, ' ');
+/** The task's own wording of what it wants: negated clauses removed, each path or filename replaced. */
+function requestedText(task: string, placeholder = ''): string {
+  return replacePaths(task, () => placeholder).replace(NEGATED_WRITE, ' ').replace(NEGATED_CLAUSE, ' ');
+}
+
+/** As requestedText, without quoted text: what the task itself says. */
+function spokenText(task: string, placeholder = ''): string {
+  return requestedText(task, placeholder).split('\n').map(withoutQuoted).join('\n');
 }
 
 function asksFor(task: string, mutations: Array<{ request: RegExp }>): boolean {
-  const requested = requestedText(task).split('\n').map(withoutQuoted).join('\n');
-  return mutations.some((mutation) => mutation.request.test(requested));
+  const spoken = spokenText(task);
+  return mutations.some((mutation) => mutation.request.test(spoken));
 }
 
-/** A mutating tool is eligible only when the task itself asks for its action: not in a path, quote or negation. */
-function taskAllows(toolName: string, task: string): boolean {
-  const mutations = mutationsOf(toolName);
-  return !mutations.length || asksFor(task, mutations);
+const CLAUSE_BREAK = /[.!?;:,\n]|\b(?:and|then|but)\b/i;
+const LEAD_FILLER = /^[\s"'`(*-]*(?:(?:please|kindly|can you|could you|would you|will you|i (?:want|need|would like)(?: you)? to|let'?s|now|first|firstly|finally|also|just|next|quickly|carefully|briefly)\b\s*)*/i;
+const PREPOSITION_LEAD = /^(?:in|on|for|from|under|at|inside|within|using|with|after|before|given)\b/i;
+const LOOKUP_LEAD = /^(?:tell|show|list|inspect|read|view|describe|explain|check|count|find|locate|measure|summari[sz]e|report|search|look|get|fetch|give|display|print|compare|examine|analy[sz]e|review|audit|identify|determine|verify|assert|confirm|enumerate|query|which|what|who|when|where|why|how|is|are|was|were|does|did|can|could)\b/i;
+const OTHER_ACTION_LEAD = /^(?:click|tap|type|press|submit|fill|enter|select|drag|swipe|run|execute|start|restart|launch|spawn|open|build|compile|deploy|commit|post|download|connect|disconnect|rotate|turn|lock|unlock|enable|disable|format|merge|release|publish|schedule|pay|buy|order)\b/i;
+
+function leadsWithAction(clause: string): boolean {
+  return OTHER_ACTION_LEAD.test(clause) || [...MUTATIONS, EXTRACT_ACTION].some((mutation) => clause.match(mutation.request)?.index === 0);
 }
+
+/**
+ * True when the task only asks to find something out: it opens as a lookup or a question and no clause opens with an
+ * action. Verbs further in ("which files the app can delete") describe; an unknown opening verb is not read-only.
+ */
+function isReadOnlyTask(task: string): boolean {
+  const clauses = spokenText(task, 'target').split(CLAUSE_BREAK).map((clause) => clause.replace(LEAD_FILLER, '')).filter(Boolean);
+  const opening = clauses.find((clause) => !PREPOSITION_LEAD.test(clause));
+  return opening !== undefined && LOOKUP_LEAD.test(opening) && !clauses.some(leadsWithAction);
+}
+
+/**
+ * Tools without effects, for cells that publish no hints. Deliberately explicit: a tool missing here is refused to
+ * read-only tasks, which is the safe way to be wrong.
+ */
+const READ_ONLY_TOOLS = new Set([
+  'hela.update.check',
+  // files and terminals
+  'read_file', 'list_directory', 'find_files', 'search_in_files', 'get_file_info', 'get_directory_size', 'compare_files', 'watch_file',
+  'terminal_ls', 'terminal_cat', 'terminal_grep', 'terminal_session_list', 'session_list', 'session_info',
+  'opencode_status', 'opencode_stats', 'opencode_models', 'opencode_mcp_list', 'opencode_auth_list',
+  // memory
+  'search_nodes', 'read_graph', 'read_graph_stream', 'open_node', 'query_data', 'search_priors', 'list_missions', 'get_timeline',
+  'get_session_context', 'get_file_context', 'get_project_guidance', 'inspect_untrusted_text', 'analyze_git_changes',
+  // time, skills and instructions
+  'get_current_time', 'convert_time', 'list_skills', 'get_skill', 'search_skills', 'load_instruction', 'search_instructions',
+  'get_prompt', 'search_prompts', 'get_resource_set', 'search_resource_sets', 'list_mcp_servers',
+  // research
+  'google_search', 'wikipedia_search', 'wikipedia_get', 'wikipedia_get_pages_in_category', 'wikipedia_page_languages',
+  'wikipedia_random', 'academic_search', 'multi_site_search', 'archive_org_search', 'search_trends', 'fact_checker',
+  'extract_content', 'url_metadata_extractor',
+  // browser: loading and observing a page
+  'browser_navigate', 'browser_search', 'browser_get_state', 'browser_get_content', 'browser_screenshot', 'browser_assert',
+  // design and 3D lookups
+  'brand_list', 'list_themes', 'list_options', 'list_installed_skills', 'list_ellis_ui_designs', 'get_ellis_ui_template',
+  'get_component', 'get_reference', 'get_cross_cutting_rules', 'get_scene_summary', 'get_object_details',
+  'get_blendfile_summary', 'get_api_docs', 'get_blender_helpers', 'get_modeling_patterns', 'get_agent_instructions',
+]);
+
+type GatedTool = Pick<AgentTool, 'realName' | 'annotations'>;
+
+/** A hint or a name that says "changes state" wins; otherwise a read-only hint or the allow-list is required. */
+function isReadOnlyTool(tool: GatedTool): boolean {
+  const { readOnlyHint, destructiveHint } = tool.annotations ?? {};
+  if (destructiveHint === true || readOnlyHint === false || isMutatingTool(tool.realName)) return false;
+  return readOnlyHint === true || READ_ONLY_TOOLS.has(tool.realName);
+}
+
+const HEADLINE_CHECK = 'document.querySelector("h1") && document.querySelector("h1").innerText.trim().length > 0';
+
+/** Arguments can give a read-only tool effects: script URLs and page JavaScript. */
+function hasReadOnlyArgs(toolName: string, args: Record<string, unknown>): boolean {
+  if (toolName === 'browser_navigate') return /^https?:\/\//i.test(String(args.url));
+  if (toolName === 'browser_assert' && (args.type ?? args.conditionType) === 'js') {
+    return args.target === HEADLINE_CHECK && args.condition === undefined;
+  }
+  return true;
+}
+
+/**
+ * The one permission check: planning, retrieval and dispatch all ask it. A write-banned or read-only task gets only
+ * read-only tools. The single exception is a read-only task (no ban) that matches one of the runtime's own
+ * side-effect-free diagnostics: the shell may then run exactly that command and nothing else.
+ */
+function taskGate(task: string) {
+  const banned = forbidsWrites(task);
+  const restricted = banned || isReadOnlyTask(task);
+  const fixed = restricted && !banned ? runtimeCommand(task) : undefined;
+  const diagnostic = fixed?.readOnly ? fixed.command : undefined;
+  return {
+    restricted,
+    /** Without args: may the tool be planned or offered. With args: may this call be dispatched. */
+    permits(tool: GatedTool, args?: Record<string, unknown>): boolean {
+      if (!restricted) return true;
+      if (tool.realName === 'execute_command') {
+        return diagnostic !== undefined && (!args
+          || (args.command === diagnostic && Object.keys(args).every((key) => key === 'command' || key === 'workingDirectory')));
+      }
+      return isReadOnlyTool(tool) && (!args || hasReadOnlyArgs(tool.realName, args));
+    },
+  };
+}
+
+type TaskGate = ReturnType<typeof taskGate>;
 
 const MAX_TRANSIENT_RETRIES = 1;
 const TRANSIENT_ERROR = /time[sd]?[\s-]?out|etimedout|econnreset|econnrefused|epipe|eagain|temporar|unavailable|restart|not ready/i;
@@ -437,7 +532,7 @@ function intentMatch(tool: AgentTool, task: string): { name: number; description
  */
 function bestIntentMatch(shortlist: AgentTool[], task: string): { tool: AgentTool; name: number } | undefined {
   return shortlist
-    .filter((tool) => !isMutatingTool(tool.realName))
+    .filter(isReadOnlyTool)
     .map((tool) => ({ tool, ...intentMatch(tool, task) }))
     .filter((match) => match.name > 1)
     .sort((a, b) => b.name - a.name || b.description - a.description)[0];
@@ -466,12 +561,12 @@ export function avoidMutatingTools(tools: AgentTool[], task: string): AgentTool[
   return safe.length ? safe : tools;
 }
 
-export function retrieveTools(tools: AgentTool[], task: string, history: HistoryStep[] = [], limit = MAX_SHORTLIST): AgentTool[] {
+export function retrieveTools(tools: AgentTool[], task: string, history: HistoryStep[] = [], limit = MAX_SHORTLIST, gate: TaskGate = taskGate(task)): AgentTool[] {
   const last = [...history].reverse().find((step) => step.ok && step.result);
   const lastName = tools.find((tool) => tool.name === last?.tool)?.realName ?? last?.tool;
   const queryExtra = last ? `${lastName} ${last.result?.slice(0, 500) ?? ''}` : '';
   const ranked = scoreTools(tools, task, queryExtra).map((entry) => entry.tool);
-  return avoidMutatingTools(ranked, task).filter((tool) => taskAllows(tool.realName, task)).slice(0, limit);
+  return avoidMutatingTools(ranked, task).filter((tool) => gate.permits(tool)).slice(0, limit);
 }
 
 /* ── deterministic task shaping ────────────────────────────────────────── */
@@ -562,26 +657,33 @@ function mentionedDirectory(text: string): string | undefined {
   return match?.[1];
 }
 
-function shellCommandFor(task: string, modelCommand?: unknown): string | undefined {
+/** Commands the runtime writes itself; readOnly marks those without side effects. The first match wins. */
+const RUNTIME_COMMANDS: Array<{ pattern: RegExp; command: string; readOnly: boolean }> = [
+  { pattern: /\b(disk|df|free space|filesystem usage)\b.*\b(usage|space|large|biggest|largest|files)?\b/, command: "df -h; echo '--- largest files ---'; du -ah . 2>/dev/null | sort -rh | head -20", readOnly: true },
+  { pattern: /\b(large|biggest|largest)\b.*\bfiles?\b/, command: "du -ah . 2>/dev/null | sort -rh | head -20", readOnly: true },
+  { pattern: /\bnpm test\b|\brun (the )?tests?\b|\btest suite\b/, command: 'npm test', readOnly: false },
+  { pattern: /\bgit diff\b/, command: 'git diff --stat; git diff', readOnly: true },
+  { pattern: /\bgit status\b/, command: 'git status --short --branch', readOnly: true },
+  { pattern: /\b(list|show)\b.*\b(files|directory|folder)\b/, command: 'ls -la', readOnly: true },
+  { pattern: /\b(processes|ps|memory usage|free memory)\b/, command: 'ps aux --sort=-%mem | head -15; free -h', readOnly: true },
+  { pattern: /\b(node|npm|pnpm|yarn) version\b/, command: 'node --version; npm --version', readOnly: true },
+  { pattern: /\bpwd|current directory\b/, command: 'pwd', readOnly: true },
+];
+
+function runtimeCommand(task: string): { command: string; readOnly: boolean } | undefined {
   const lower = maskPaths(task).toLowerCase();
-  const backtick = task.match(/`([^`]{2,300})`/);
-  if (backtick) return backtick[1].trim();
   if (/\b(count|how many)\b.*\b(lines?|loc)\b/i.test(lower)) {
     const dir = mentionedDirectory(task) ?? '.';
-    return `find ${dir} -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mjs' \\) -print0 | xargs -0 wc -l | sort -n | tail -20`;
+    return { command: `find ${dir} -type f \\( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mjs' \\) -print0 | xargs -0 wc -l | sort -n | tail -20`, readOnly: true };
   }
-  const commands: Array<{ pattern: RegExp; command: string }> = [
-    { pattern: /\b(disk|df|free space|filesystem usage)\b.*\b(usage|space|large|biggest|largest|files)?\b/, command: "df -h; echo '--- largest files ---'; du -ah . 2>/dev/null | sort -rh | head -20" },
-    { pattern: /\b(large|biggest|largest)\b.*\bfiles?\b/, command: "du -ah . 2>/dev/null | sort -rh | head -20" },
-    { pattern: /\bnpm test\b|\brun (the )?tests?\b|\btest suite\b/, command: 'npm test' },
-    { pattern: /\bgit diff\b/, command: 'git diff --stat; git diff' },
-    { pattern: /\bgit status\b/, command: 'git status --short --branch' },
-    { pattern: /\b(list|show)\b.*\b(files|directory|folder)\b/, command: 'ls -la' },
-    { pattern: /\b(processes|ps|memory usage|free memory)\b/, command: 'ps aux --sort=-%mem | head -15; free -h' },
-    { pattern: /\b(node|npm|pnpm|yarn) version\b/, command: 'node --version; npm --version' },
-    { pattern: /\bpwd|current directory\b/, command: 'pwd' },
-  ];
-  for (const entry of commands) if (entry.pattern.test(lower)) return entry.command;
+  return RUNTIME_COMMANDS.find((entry) => entry.pattern.test(lower));
+}
+
+function shellCommandFor(task: string, modelCommand?: unknown): string | undefined {
+  const backtick = task.match(/`([^`]{2,300})`/);
+  if (backtick) return backtick[1].trim();
+  const fixed = runtimeCommand(task);
+  if (fixed) return fixed.command;
   if (typeof modelCommand === 'string') {
     const value = modelCommand.trim();
     if (value && value !== 'bash' && value !== 'sh' && !/^(check|list|run|execute|command)\b/i.test(value)) return value;
@@ -618,7 +720,11 @@ function intentForTool(name: string): string {
   return 'other';
 }
 
-function planFor(task: string): PlannedStep[] {
+function planFor(task: string, gate: TaskGate): PlannedStep[] {
+  return draftPlan(task, gate).filter((step) => gate.permits({ realName: step.tool }));
+}
+
+function draftPlan(task: string, gate: TaskGate): PlannedStep[] {
   const lower = maskPaths(task).toLowerCase();
   const steps: PlannedStep[] = [];
   const url = extractUrl(task);
@@ -636,7 +742,7 @@ function planFor(task: string): PlannedStep[] {
 
   if (hasAny(lower, /\b(remember|store in memory|save to memory|knowledge graph|observation)\b/)) {
     // A memory lookup asks for no write: leave it unplanned so retrieval offers the readers.
-    if (!taskAllows('memory_edit', task)) return steps;
+    if (!asksFor(task, [WRITE_ACTION, DELETE_ACTION])) return steps;
     steps.push({ intent: 'memory', tool: 'memory_edit', description: 'store the information in the project memory graph' });
     return steps;
   }
@@ -655,7 +761,7 @@ function planFor(task: string): PlannedStep[] {
   }
   const localExplore = hasAny(lower, /\b(find|locate|count|inspect|measure)\b/)
     && hasAny(lower, /\b(files?|director(?:y|ies)|source|code|repo(?:sitory)?|runtime|packages?|typescript|\.ts|\.js|\.mjs)\b/);
-  if (!browser && (shellIntent || localExplore)) {
+  if (!browser && (shellIntent || localExplore) && gate.permits({ realName: 'execute_command' })) {
     steps.push({ intent: 'shell', tool: 'execute_command', description: 'run the shell command for this task' });
     return steps;
   }
@@ -786,6 +892,9 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
   if (byName === 'execute_command') {
     delete args.host;
     delete args.username;
+    if (taskGate(task).restricted) {
+      for (const key of Object.keys(args)) if (key !== 'command') delete args[key];
+    }
     if (!hasAny(lower, /\b(ssh|remote|host)\b/)) repairs.push('host/username: local execution');
     if (typeof args.session === 'string' && !hasAny(lower, /\bsession\b/)) {
       delete args.session;
@@ -846,7 +955,7 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
       const query = searchTerm && searchTerm.length < 80 ? searchTerm : 'HeLa';
       // If a separate type/press step follows, open the main page so the
       // search box is available; otherwise deep-link to search results.
-      const willType = hasAny(lower, /\b(search|find|look up|lookup)\b/);
+      const willType = hasAny(lower, /\b(search|find|look up|lookup)\b/) && taskGate(task).permits({ realName: 'browser_type' });
       set('url', willType ? 'https://en.wikipedia.org/wiki/Main_Page' : `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(query)}`, 'Wikipedia page URL');
     } else if (url) {
       set('url', url, 'extracted URL');
@@ -875,7 +984,7 @@ export function repairArgs(tool: AgentTool, generated: Record<string, unknown>, 
       delete args.condition;
     } else {
       set('type', 'js', 'assert JavaScript condition');
-      set('target', 'document.querySelector("h1") && document.querySelector("h1").innerText.trim().length > 0', 'headline presence check');
+      set('target', HEADLINE_CHECK, 'headline presence check');
       delete args.expected;
       delete args.condition;
     }
@@ -1111,7 +1220,7 @@ export class NativeNeedleAgent {
     const task = String(args.task ?? '').trim();
     if (!task) return { ok: false, status: 'failed', error: 'task is required' };
     const catalog = this.catalog();
-    const plan = planFor(task);
+    const plan = planFor(task, taskGate(task));
     const retrieved = retrieveTools(catalog, task, [], Math.max(MAX_SHORTLIST, Number(args.limit) || MAX_SHORTLIST));
     return {
       ok: true,
@@ -1136,8 +1245,8 @@ export class NativeNeedleAgent {
     const health = this.health();
     if (!health.ok) return { ok: false, status: 'failed', error: health.detail, health };
 
-    const planned = planFor(task);
-    const readOnly = forbidsWrites(task);
+    const gate = taskGate(task);
+    const planned = planFor(task, gate);
     const history: HistoryStep[] = [];
     const notes: string[] = [];
     const retrievedNames = new Set<string>();
@@ -1167,18 +1276,17 @@ export class NativeNeedleAgent {
         // Keep the shortlist inside the step's intent family. Needle was
         // choosing write_file for a navigate step when the shortlist mixed
         // families, which executed the wrong action.
-        const alternatives = retrieveTools(catalog, `${task} ${step.description}`, history, MAX_SHORTLIST * 3)
+        const alternatives = retrieveTools(catalog, `${task} ${step.description}`, history, MAX_SHORTLIST * 3, gate)
           .filter((tool) => intentForTool(tool.realName) === step.intent || tool.realName === step.tool);
         shortlist = [plannedTool, ...alternatives].filter((tool): tool is AgentTool => Boolean(tool))
           .filter((tool, index, all) => all.findIndex((candidate) => candidate.name === tool.name) === index)
           .slice(0, MAX_SHORTLIST);
       } else {
-        shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST);
+        shortlist = retrieveTools(catalog, task, history, MAX_SHORTLIST, gate);
       }
-      if (readOnly) shortlist = shortlist.filter((tool) => !isMutatingTool(tool.realName));
-      shortlist = shortlist.filter((tool) => taskAllows(tool.realName, task));
+      shortlist = shortlist.filter((tool) => gate.permits(tool));
       if (!planned.length) shortlist = shortlist.filter((tool) => !unanswered.has(tool.name));
-      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : readOnly || (step && !taskAllows(step.tool, task)) ? 'no permitted tools' : 'no relevant tools'; break; }
+      if (!shortlist.length) { decision = unanswered.size ? 'no remaining tool could answer the task' : gate.restricted ? 'no permitted tools' : 'no relevant tools'; break; }
       const preferred = shortlist.find((tool) => tool.realName === step?.tool);
       for (const tool of shortlist) retrievedNames.add(tool.name);
       // An unplanned lookup opens with the tool that names it (runtime#4: get_current_time, not watch_file). A task
@@ -1238,6 +1346,14 @@ export class NativeNeedleAgent {
           break;
         }
         previousFailure.retries++;
+      }
+
+      // The only way to a cell: whatever planning or the model chose, the gate sees the final arguments.
+      if (!gate.permits(chosen, repaired.args)) {
+        history.push({ iteration: iterations, intent: intentForTool(chosen.realName), tool: chosen.name, args: repaired.args, ok: false, error: 'not permitted for a read-only task', ms: 0 });
+        lastCallOk = false;
+        decision = `blocked by the permission gate (${chosen.name})`;
+        break;
       }
 
       const callStarted = Date.now();

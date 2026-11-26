@@ -31,7 +31,8 @@ const EISDIR = envelope({ success: false, message: 'Failed to read file: EISDIR:
 const TASK = 'Tell me the current time in Asia/Jakarta. Do not modify any files.';
 // A clock whose name shares no word with TASK, so the loop follows the stubbed picks instead of
 // opening with a name match (RT-08).
-const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? tool('clock_now', entry.description) : entry));
+const clockNow = (entry) => ({ ...tool('clock_now', entry.description), annotations: { readOnlyHint: true } });
+const unnamedClock = catalog.map((entry) => (entry.name === 'get_current_time' ? clockNow(entry) : entry));
 function agentWith(executeAgentTool, picks, tools = catalog) {
   const host = { agentCatalog: () => tools, agentContext: () => ({ workspaceRoot: '/tmp/ws', cwd: '/tmp/cwd' }), executeAgentTool };
   const agent = new NativeNeedleAgent(host, { root: assetRoot, profile: null });
