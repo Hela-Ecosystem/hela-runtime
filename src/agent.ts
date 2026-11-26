@@ -329,9 +329,14 @@ const NEGATED_WRITE = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\
 // whether a chosen write would land on that file, so every mutating tool is withheld.
 const PROTECTED_INPUT = /^\s*(?:the\s+|its\s+|their\s+)?(?:original|source|input)\b/i;
 
+/** Typed apostrophes ("don’t") must ban the same things as straight ones. */
+function straightQuotes(text: string): string {
+  return text.replace(/\u2019/g, "'");
+}
+
 /** True when the task bans writes outright; only a ban scoped to the task's own input leaves other writes allowed. */
 export function forbidsWrites(task: string): boolean {
-  return [...task.matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
+  return [...straightQuotes(task).matchAll(NEGATED_WRITE)].some((match) => !PROTECTED_INPUT.test(match[1] ?? ''));
 }
 
 /** Verbs in a tool name that change state, each with the wording by which a task asks for that change. */
@@ -424,7 +429,7 @@ function withoutQuoted(line: string): string {
   return kept + line.slice(from);
 }
 
-const NEGATOR = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid|refrain\s+from|no\s+need\s+to)\b/i;
+const NEGATOR = /\b(?:do\s*n[o']?t|don'?t|never|without|must\s+not|should\s+not|shouldn'?t|avoid|refrain\s+from|no\s+need\s+to|no(?=\s+[a-z]+ing\b))\b/i;
 // A ban ends at a contrast, or at "and" opening a new request ("do not click Delete and take a screenshot").
 const NEGATION_BOUNDARY = /(,|\b(?:but|instead|however|then)\b|\band\b(?=\s+(?:also\s+)?(?:take|open|navigate|go|visit|tell|show|list|read|report|inspect|check|verify|search|find|capture|summari[sz]e)\b))/i;
 // Past a comma it continues only through a list: "do not click, type, or submit".
@@ -435,7 +440,7 @@ const NO_VERB_YET = /^\s*(?:(?:ever|under|at|for|in|on|please)\b.*)?$/i;
 /** Separates what a text asks for from what it bans. One pass over its sentences and clauses. */
 function splitNegations(text: string): { affirmative: string; negated: string[] } {
   const negated: string[] = [];
-  const affirmative = text.split(/([.!?;\n])/).map((sentence) => {
+  const affirmative = straightQuotes(text).split(/([.!?;\n])/).map((sentence) => {
     let banning = false;
     let awaitingVerb = false;
     return sentence.split(NEGATION_BOUNDARY).map((part, index, parts) => {
@@ -485,9 +490,9 @@ function asksFor(task: string, mutations: Mutation[]): boolean {
 }
 
 const CLAUSE_BREAK = /[.!?;:,\n]|\b(?:and|then|but)\b/i;
-const LEAD_FILLER = /^[\s"'`(*-]*(?:(?:please|kindly|can you|could you|would you|will you|i (?:want|need|would like)(?: you)? to|let'?s|now|first|firstly|finally|also|just|next|quickly|carefully|briefly)\b\s*)*/i;
+const LEAD_FILLER = /^[\s"'`(*-]*(?:(?:hey|hi|hello|ok|okay|so|please|kindly|can you|could you|would you|will you|i (?:want|need|would like)(?: you)? to|let'?s|now|first|firstly|finally|also|just|next|quickly|carefully|briefly)\b\s*)*/i;
 const PREPOSITION_LEAD = /^(?:in|on|for|from|under|at|inside|within|using|with|after|before|given)\b/i;
-const LOOKUP_LEAD = /^(?:tell|show|list|inspect|read|view|describe|explain|check|count|find|locate|measure|summari[sz]e|report|search|look|get|fetch|give|display|print|compare|examine|analy[sz]e|review|audit|identify|determine|verify|assert|confirm|enumerate|query|which|what|who|when|where|why|how|is|are|was|were|does|did|can|could)\b/i;
+const LOOKUP_LEAD = /^(?:know|see|tell|show|list|inspect|read|view|describe|explain|check|count|find|locate|measure|summari[sz]e|report|search|look|get|fetch|give|display|print|compare|examine|analy[sz]e|review|audit|identify|determine|verify|assert|confirm|enumerate|query|which|what|who|when|where|why|how|is|are|was|were|does|did|can|could)\b/i;
 const OTHER_ACTION_LEAD = /^(?:click|tap|type|press|submit|fill|enter|select|drag|swipe|run|execute|start|restart|launch|spawn|open|build|compile|deploy|commit|post|download|connect|disconnect|rotate|turn|lock|unlock|enable|disable|format|merge|release|publish|schedule|pay|buy|order)\b/i;
 
 function leadsWithAction(clause: string): boolean {

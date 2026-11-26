@@ -144,6 +144,19 @@ for (const flavour of FLAVOURS) {
     }
   }
 
+  test(`gate (${flavour}): typed apostrophes and "no clicking" are bans too`, async () => {
+    for (const task of ['Open https://example.test/a. No clicking.', 'Open https://example.test/a. Don\u2019t click anything.', 'Open https://example.test/a. Don\u2019t modify anything, then click Next']) {
+      const { ran, plan } = await run(page, task, 'browser_click', { browser_navigate: { url: 'https://example.test/a' } });
+      assert.ok(!plan.includes('browser_click') && !ran.includes('browser_click'), task);
+    }
+  });
+
+  test(`gate (${flavour}): politely worded lookups are read-only`, async () => {
+    for (const task of ['Hey, inspect the settings', 'I want to know the settings', 'Okay, could you please check the settings']) {
+      assert.deepEqual(retrieveTools(tools, task, [], 50).map((tool) => tool.realName).filter((name) => SIDE_EFFECTS.includes(name)), [], task);
+    }
+  });
+
   test(`gate (${flavour}): a ban ends where the next request begins`, async () => {
     const planOf = async (task) => (await run(page, task, 'browser_navigate')).plan;
     assert.deepEqual(await planOf('Open https://example.test/a. Do not click Delete and take a screenshot'), ['browser_navigate', 'browser_screenshot']);
