@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { passiveHealthFields } from './orchestrator-mode.js';
 import { VERSION } from './version.js';
 
 export interface HttpAdapterOptions {
@@ -33,7 +34,7 @@ export class HttpAdapter {
       const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', transport: 'http', version: VERSION }));
+        res.end(JSON.stringify({ status: 'ok', transport: 'http', version: VERSION, ...passiveHealthFields() }));
         return;
       }
       if (req.method === 'POST' && mcpPath(url.pathname)) {

@@ -1,0 +1,75 @@
+/**
+ * Passive mode for external DAG coordinators (chaining-mcp#30). With
+ * MITOSIS_EXTERNAL_ORCHESTRATOR set, the runtime offers no way to orchestrate:
+ * its own agent and pipe are hidden, and so is every Mitosis tool outside the
+ * allow-list. The list mirrors chaining-mcp's src/config/orchestrator-mode.ts;
+ * the runtime needs its own copy because it advertises cells from cached
+ * manifests without starting them.
+ */
+export const MITOSIS_CELL = 'hela-mitosis';
+
+export interface OrchestratorMode {
+  passive: boolean;
+  externalOrchestrator: string | null;
+}
+
+const PASSIVE_MITOSIS_TOOLS: ReadonlySet<string> = new Set([
+  'list_mcp_servers', 'analyze_tools',
+  'get_tool_chain_analysis', 'validate_tool_chain', 'analyze_tool_chain_performance',
+  'get_current_time', 'convert_time',
+  'search_instructions', 'load_instruction',
+  'get_prompt', 'search_prompts', 'get_resource_set', 'search_resource_sets',
+  'list_skills', 'search_skills', 'get_skill',
+]);
+const PASSIVE_LLM_TOOLS: ReadonlySet<string> = new Set(['llm_query', 'llm_summarize']);
+const RUNTIME_ORCHESTRATION_TOOLS: ReadonlySet<string> = new Set(['hela.agent.run', 'agent_run', 'hela.pipe']);
+/** Names a caller may still try directly; they get the structured refusal instead of "unknown tool". */
+const OMITTED_MITOSIS_TOOLS: ReadonlySet<string> = new Set([
+  'workflow_orchestrator', 'workflow_status', 'workflow_cancel', 'sequentialthinking',
+  'analyze_with_sequential_thinking', 'generate_route_suggestions', 'suggest_skill_chain', 'brainstorming',
+  'llm_decompose_task', 'llm_suggest_route',
+]);
+
+export function orchestratorMode(env: NodeJS.ProcessEnv = process.env): OrchestratorMode {
+  const externalOrchestrator = (env.MITOSIS_EXTERNAL_ORCHESTRATOR ?? '').trim() || null;
+  return { passive: externalOrchestrator !== null, externalOrchestrator };
+}
+
+/** Whether a cell's tool, by its own (never namespaced) name, may be offered in the current mode. */
+export function isCellToolAllowed(cell: string, tool: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (cell !== MITOSIS_CELL || !orchestratorMode(env).passive) return true;
+  if (PASSIVE_MITOSIS_TOOLS.has(tool)) return true;
+  return PASSIVE_LLM_TOOLS.has(tool) && (env.CHAINING_LLM_ENABLED || 'true').toLowerCase() !== 'false';
+}
+
+export function isRuntimeToolHidden(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  return orchestratorMode(env).passive && RUNTIME_ORCHESTRATION_TOOLS.has(name);
+}
+
+/**
+ * The structured refusal for a direct call to a hidden tool, or null. `owner` is
+ * the cell the runtime routes this name to, so another cell's tool is never refused.
+ */
+export function passiveRefusal(name: string, owner: string | undefined, env: NodeJS.ProcessEnv = process.env) {
+  const { passive, externalOrchestrator } = orchestratorMode(env);
+  if (!passive) return null;
+  const bare = name.replace(/^hela_mitosis_/, '');
+  const omitted = OMITTED_MITOSIS_TOOLS.has(bare) || bare === 'agent_run'
+    || ((PASSIVE_LLM_TOOLS.has(bare)) && !isCellToolAllowed(MITOSIS_CELL, bare, env));
+  const hidden = RUNTIME_ORCHESTRATION_TOOLS.has(name) || (omitted && (owner === undefined || owner === MITOSIS_CELL));
+  if (!hidden) return null;
+  return {
+    ok: false as const,
+    code: 'MITOSIS_PASSIVE_MODE' as const,
+    mode: 'passive' as const,
+    externalOrchestrator,
+    tool: name,
+    error: `${name} is disabled while MITOSIS_EXTERNAL_ORCHESTRATOR=${externalOrchestrator}`,
+  };
+}
+
+/** Additive health fields, present only in passive mode so the autonomous payload is unchanged. */
+export function passiveHealthFields(env: NodeJS.ProcessEnv = process.env): { mode?: 'passive'; externalOrchestrator?: string | null } {
+  const { passive, externalOrchestrator } = orchestratorMode(env);
+  return passive ? { mode: 'passive', externalOrchestrator } : {};
+}

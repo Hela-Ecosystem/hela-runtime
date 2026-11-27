@@ -17,6 +17,7 @@ import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
+import { isCellToolAllowed, isRuntimeToolHidden, orchestratorMode, passiveHealthFields, passiveRefusal } from './orchestrator-mode.js';
 import { HttpAdapter } from './http-adapter.js';
 import { spawn } from 'node:child_process';
 import type { CellSpec, CellHandle } from './types.js';
@@ -340,7 +341,8 @@ export class HelaRuntime {
    * local process can use it without being handed the URL.
    */
   private cellEnvironment(spec: CellSpec): Promise<Record<string, string> | undefined> {
-    if (spec.id !== 'hela-mitosis' || process.env.HELA_RUNTIME_URL) return Promise.resolve(undefined);
+    // Passive Mitosis runs no workflows, so it gets no endpoint to call other cells with.
+    if (spec.id !== 'hela-mitosis' || process.env.HELA_RUNTIME_URL || orchestratorMode().passive) return Promise.resolve(undefined);
     if (!this.internalEndpoint) {
       const secretPath = `/mcp/${randomBytes(16).toString('hex')}`;
       const adapter = new HttpAdapter(() => { const s = this.createServer(); this.attachHandlers(s); return s; }, { port: 0, host: '127.0.0.1', secretPath });
@@ -369,6 +371,8 @@ export class HelaRuntime {
         await shutdownCell(handle);
         return;
       }
+      // Filtered once here, so listing, routing, pipes, the catalog and the cached manifest all agree.
+      for (const name of [...handle.tools.keys()]) if (!isCellToolAllowed(spec.id, name)) handle.tools.delete(name);
       this.cells.set(handle.key, handle);
       this.logEvent(spec.id, 'start', true);
       this.cellStartupMs.set(spec.id, performance.now() - started);
@@ -443,9 +447,10 @@ export class HelaRuntime {
         const manifest = this.manifests.load(spec);
         this.manifestSources.set(spec.id, manifest.source);
         reasons.set(spec.id, manifest.reason);
-        this.cachedManifest[spec.id] = manifest.tools;
+        const tools = manifest.tools.filter((tool) => isCellToolAllowed(spec.id, tool.name));
+        this.cachedManifest[spec.id] = tools;
         const cellShort = spec.id.replace(/^hela-/, '');
-        for (const tool of manifest.tools) {
+        for (const tool of tools) {
           const exposed = this.namespaced ? `hela_${cellShort}_${tool.name}` : tool.name;
           if (this.toolToCell.has(exposed)) throw new Error(`Duplicate tool: ${exposed}`);
           this.toolToCell.set(exposed, spec.id);
@@ -513,6 +518,7 @@ export class HelaRuntime {
           const status = {
             status: 'ok', liveness: 'live', readiness: ready ? 'ready' : 'not_ready', ready,
             version: VERSION,
+            ...passiveHealthFields(),
             profile: this.profile ?? 'all',
             counters: this.metricsSnapshot(),
             cells: [...this.specs.keys()].map((id) => {
@@ -936,13 +942,15 @@ export class HelaRuntime {
           },
         });
       }
-      return { tools };
+      return { tools: tools.filter((tool) => !isRuntimeToolHidden(tool.name)) };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const name = req.params.name;
       const args = req.params.arguments ?? {};
       if (this.stopping) return { content: [{ type: 'text', text: 'Runtime is shutting down' }], isError: true };
+      const refusal = passiveRefusal(name, this.toolToCell.get(name));
+      if (refusal) return { content: [{ type: 'text', text: JSON.stringify(refusal, null, 2) }], isError: true };
 
       if (name === UPDATE_CHECK_TOOL || name === UPDATE_APPLY_TOOL) {
         return this.jsonResult(await this.invokeTool(RUNTIME_UPDATE_CELL, name, () => this.executeRuntimeUpdate(name, args)));

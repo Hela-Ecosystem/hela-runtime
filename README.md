@@ -1,10 +1,14 @@
 # HeLa Runtime
 
-> **HeLa Runtime v1.4.5** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
+> **HeLa Runtime v1.5.0** — an on-demand supervisor that multiplexes HeLa cells behind one stdio or Streamable HTTP endpoint. Optional companion to the [HeLa MCP Ecosystem](https://github.com/Hela-Ecosystem/hela-mcp-ecosystem).
 
 ![Blotcat plugging MCP server cables into the central AI Hub](https://raw.githubusercontent.com/Hela-Ecosystem/.github/main/profile/hela-logo-1024.png)
 
 ---
+
+## Passive mode (external orchestrators)
+
+`MITOSIS_EXTERNAL_ORCHESTRATOR=<name>` (for example `meta7` or `passive`) hands the control plane to an external coordinator. The runtime hides and refuses `hela.agent.run`, `hela.pipe` and every Mitosis tool outside the [passive allow-list](https://github.com/Hela-Ecosystem/chaining-mcp#passive-mode-external-orchestrators); other cells are unaffected. `hela.agent.plan`, `hela.catalog.list`, `hela.catalog.search` and the update tools stay. `/healthz` adds `mode` and `externalOrchestrator`. The variable is read from the runtime's environment, so restart the runtime after changing it.
 
 ## Respectful Attribution & Metaphor
 
