@@ -1,3 +1,8 @@
+## [1.5.0] - 2026-11-27
+
+### Added
+- Passive mode for external DAG coordinators (chaining-mcp#30). With `MITOSIS_EXTERNAL_ORCHESTRATOR` set, `hela.agent.run`, `hela.pipe` and the Mitosis tools outside the allow-list are not listed, and direct calls return `MITOSIS_PASSIVE_MODE` with `isError: true`. Mitosis gets no `HELA_RUNTIME_URL`, cached manifests are kept apart from autonomous ones, and `/healthz` adds `mode` and `externalOrchestrator`. `hela.agent.plan` and `hela.catalog.*` stay, since they only read. Unset, behaviour is unchanged. Needs Mitosis 3.2.0 for the same guarantees inside the cell.
+
 ## [1.4.5] - 2026-11-26
 
 ### Security
