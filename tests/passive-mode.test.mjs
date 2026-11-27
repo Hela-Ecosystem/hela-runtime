@@ -84,6 +84,7 @@ test('mode resolution and allow-list', () => {
   assert.equal(isRuntimeToolHidden('agent_run', undefined, env), true);
   assert.equal(passiveRefusal('hela_mitosis_some_future_tool', undefined, new Set(), env)?.code, 'MITOSIS_PASSIVE_MODE');
   assert.equal(passiveRefusal('some_future_tool', undefined, new Set(['some_future_tool']), env)?.code, 'MITOSIS_PASSIVE_MODE');
+  assert.equal(passiveRefusal('workflow_orchestrator', undefined, new Set(), env)?.code, 'MITOSIS_PASSIVE_MODE', 'warm restart');
   assert.equal(passiveRefusal('hela.pipe', undefined, new Set(), {}), null);
   assert.equal(isCellToolAllowed('hela-mitosis', 'llm_query', { ...env, CHAINING_LLM_ENABLED: ' False ' }), false);
 });
@@ -159,10 +160,15 @@ test('an inherited HELA_RUNTIME_URL is removed, and re-enabled LLM tools return 
   const first = await start(t, box, true);
   assert.deepEqual((await first.call('hela_mitosis_get_current_time')).body, { ran: 'get_current_time', runtimeUrl: null });
   assert.ok(!(await first.names()).includes('hela_mitosis_llm_query'));
+  assert.ok(!(await first.names()).includes('hela_mitosis_some_future_tool'));
   await first.stop();
   process.env.CHAINING_LLM_ENABLED = 'true';
   const second = await start(t, box, true);
-  await second.call('hela_mitosis_get_current_time');
+  // Listed before any call: a stale cached manifest must not hide it until the cell starts.
   assert.ok((await second.names()).includes('hela_mitosis_llm_query'));
+  await second.call('hela_mitosis_get_current_time');
+  const listed = await second.names();
+  assert.ok(listed.includes('hela_mitosis_llm_query') && !listed.includes('hela_mitosis_some_future_tool'));
+  assert.equal((await second.call('hela_mitosis_some_future_tool')).body.code, 'MITOSIS_PASSIVE_MODE');
   await second.stop();
 });

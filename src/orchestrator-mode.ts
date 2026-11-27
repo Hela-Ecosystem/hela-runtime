@@ -23,6 +23,12 @@ const PASSIVE_MITOSIS_TOOLS: ReadonlySet<string> = new Set([
 ]);
 const PASSIVE_LLM_TOOLS: ReadonlySet<string> = new Set(['llm_query', 'llm_summarize']);
 const RUNTIME_ORCHESTRATION_TOOLS: ReadonlySet<string> = new Set(['hela.agent.run', 'agent_run', 'hela.pipe']);
+/** Known omitted names, so a bare call is refused even after a warm restart from an already filtered manifest. */
+const OMITTED_MITOSIS_TOOLS: ReadonlySet<string> = new Set([
+  'workflow_orchestrator', 'workflow_status', 'workflow_cancel', 'sequentialthinking',
+  'analyze_with_sequential_thinking', 'generate_route_suggestions', 'suggest_skill_chain', 'brainstorming',
+  'llm_decompose_task', 'llm_suggest_route',
+]);
 export function orchestratorMode(env: NodeJS.ProcessEnv = process.env): OrchestratorMode {
   const externalOrchestrator = (env.MITOSIS_EXTERNAL_ORCHESTRATOR ?? '').trim() || null;
   return { passive: externalOrchestrator !== null, externalOrchestrator };
@@ -56,7 +62,7 @@ export function passiveRefusal(name: string, owner: string | undefined, filtered
   const namespaced = /^hela_mitosis_(.+)$/.exec(name)?.[1];
   const hidden = isRuntimeToolHidden(name, owner, env)
     || (namespaced !== undefined && !isCellToolAllowed(MITOSIS_CELL, namespaced, env))
-    || (filtered.has(name) && isMitosisOrUnrouted(owner));
+    || ((filtered.has(name) || OMITTED_MITOSIS_TOOLS.has(name)) && isMitosisOrUnrouted(owner));
   if (!hidden) return null;
   return {
     ok: false as const,

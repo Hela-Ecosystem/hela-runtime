@@ -341,6 +341,8 @@ export class HelaRuntime {
    * needs an MCP endpoint. An operator-set HELA_RUNTIME_URL wins; otherwise the runtime serves a
    * loopback-only endpoint on an ephemeral port whose path is a random capability, so no other
    * local process can use it without being handed the URL.
+   *
+   * An operator-set URL takes precedence in autonomous mode only; passive Mitosis gets none at all.
    */
   private cellEnvironment(spec: CellSpec): Promise<Record<string, string | undefined> | undefined> {
     if (spec.id !== 'hela-mitosis') return Promise.resolve(undefined);
@@ -455,8 +457,11 @@ export class HelaRuntime {
         const manifest = this.manifests.load(spec);
         this.manifestSources.set(spec.id, manifest.source);
         reasons.set(spec.id, manifest.reason);
-        const tools = manifest.tools.filter((tool) => isCellToolAllowed(spec.id, tool.name));
-        for (const tool of manifest.tools) if (!tools.includes(tool)) this.filteredTools.add(tool.name);
+        const tools = manifest.tools.filter((tool) => {
+          const allowed = isCellToolAllowed(spec.id, tool.name);
+          if (!allowed) this.filteredTools.add(tool.name);
+          return allowed;
+        });
         this.cachedManifest[spec.id] = tools;
         const cellShort = spec.id.replace(/^hela-/, '');
         for (const tool of tools) {
