@@ -23,13 +23,6 @@ const PASSIVE_MITOSIS_TOOLS: ReadonlySet<string> = new Set([
 ]);
 const PASSIVE_LLM_TOOLS: ReadonlySet<string> = new Set(['llm_query', 'llm_summarize']);
 const RUNTIME_ORCHESTRATION_TOOLS: ReadonlySet<string> = new Set(['hela.agent.run', 'agent_run', 'hela.pipe']);
-/** Names a caller may still try directly; they get the structured refusal instead of "unknown tool". */
-const OMITTED_MITOSIS_TOOLS: ReadonlySet<string> = new Set([
-  'workflow_orchestrator', 'workflow_status', 'workflow_cancel', 'sequentialthinking',
-  'analyze_with_sequential_thinking', 'generate_route_suggestions', 'suggest_skill_chain', 'brainstorming',
-  'llm_decompose_task', 'llm_suggest_route',
-]);
-
 export function orchestratorMode(env: NodeJS.ProcessEnv = process.env): OrchestratorMode {
   const externalOrchestrator = (env.MITOSIS_EXTERNAL_ORCHESTRATOR ?? '').trim() || null;
   return { passive: externalOrchestrator !== null, externalOrchestrator };
@@ -39,24 +32,31 @@ export function orchestratorMode(env: NodeJS.ProcessEnv = process.env): Orchestr
 export function isCellToolAllowed(cell: string, tool: string, env: NodeJS.ProcessEnv = process.env): boolean {
   if (cell !== MITOSIS_CELL || !orchestratorMode(env).passive) return true;
   if (PASSIVE_MITOSIS_TOOLS.has(tool)) return true;
-  return PASSIVE_LLM_TOOLS.has(tool) && (env.CHAINING_LLM_ENABLED || 'true').toLowerCase() !== 'false';
+  return PASSIVE_LLM_TOOLS.has(tool) && (env.CHAINING_LLM_ENABLED || 'true').trim().toLowerCase() !== 'false';
 }
 
-export function isRuntimeToolHidden(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  return orchestratorMode(env).passive && RUNTIME_ORCHESTRATION_TOOLS.has(name);
+/** A bare `agent_run` belongs to the runtime unless the name is routed to a cell other than Mitosis. */
+function isMitosisOrUnrouted(owner: string | undefined): boolean {
+  return owner === undefined || owner === MITOSIS_CELL;
+}
+
+export function isRuntimeToolHidden(name: string, owner: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!orchestratorMode(env).passive || !RUNTIME_ORCHESTRATION_TOOLS.has(name)) return false;
+  return name !== 'agent_run' || isMitosisOrUnrouted(owner);
 }
 
 /**
- * The structured refusal for a direct call to a hidden tool, or null. `owner` is
- * the cell the runtime routes this name to, so another cell's tool is never refused.
+ * The structured refusal for a direct call to a hidden tool, or null. `owner` is the cell the runtime
+ * routes this name to; `filtered` holds the Mitosis tool names the allow-list removed, so a tool added
+ * later is refused the same way. A `hela_mitosis_` name is judged by the allow-list itself.
  */
-export function passiveRefusal(name: string, owner: string | undefined, env: NodeJS.ProcessEnv = process.env) {
+export function passiveRefusal(name: string, owner: string | undefined, filtered: ReadonlySet<string> = new Set(), env: NodeJS.ProcessEnv = process.env) {
   const { passive, externalOrchestrator } = orchestratorMode(env);
   if (!passive) return null;
-  const bare = name.replace(/^hela_mitosis_/, '');
-  const omitted = OMITTED_MITOSIS_TOOLS.has(bare) || bare === 'agent_run'
-    || ((PASSIVE_LLM_TOOLS.has(bare)) && !isCellToolAllowed(MITOSIS_CELL, bare, env));
-  const hidden = RUNTIME_ORCHESTRATION_TOOLS.has(name) || (omitted && (owner === undefined || owner === MITOSIS_CELL));
+  const namespaced = /^hela_mitosis_(.+)$/.exec(name)?.[1];
+  const hidden = isRuntimeToolHidden(name, owner, env)
+    || (namespaced !== undefined && !isCellToolAllowed(MITOSIS_CELL, namespaced, env))
+    || (filtered.has(name) && isMitosisOrUnrouted(owner));
   if (!hidden) return null;
   return {
     ok: false as const,

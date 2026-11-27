@@ -112,7 +112,10 @@ export class ManifestStore {
     const keys = new Set([...(spec.env ?? []), ...Object.keys(spec.toolFeatures ?? {}), 'NODE_ENV']);
     for (const rule of Object.values(spec.toolFeatures ?? {})) if (rule.pathEnv) keys.add(rule.pathEnv);
     // A passive manifest is shorter: it must never be served to an autonomous start, or the reverse.
-    if (spec.id === MITOSIS_CELL && orchestratorMode().passive) keys.add('MITOSIS_EXTERNAL_ORCHESTRATOR');
+    if (spec.id === MITOSIS_CELL && orchestratorMode().passive) {
+      keys.add('MITOSIS_EXTERNAL_ORCHESTRATOR');
+      keys.add('CHAINING_LLM_ENABLED');
+    }
     const environment = [...keys].sort().map(key => [key, process.env[key] ?? null]);
     return { digest, features, revision, fingerprint: hash([spec, digest, features, revision, environment]) };
   }

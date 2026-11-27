@@ -10,7 +10,7 @@ export interface BootOptions {
   shutdownGraceMs?: number;
   signal?: AbortSignal;
   /** Extra environment for this cell, layered over the runtime's own. */
-  env?: Record<string, string>;
+  env?: Record<string, string | undefined>;
 }
 
 /** One line of the cell's JSON-RPC stream, before any payload is trusted. */

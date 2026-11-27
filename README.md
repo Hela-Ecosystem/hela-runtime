@@ -8,7 +8,7 @@
 
 ## Passive mode (external orchestrators)
 
-`MITOSIS_EXTERNAL_ORCHESTRATOR=<name>` (for example `meta7` or `passive`) hands the control plane to an external coordinator. The runtime hides and refuses `hela.agent.run`, `hela.pipe` and every Mitosis tool outside the [passive allow-list](https://github.com/Hela-Ecosystem/chaining-mcp#passive-mode-external-orchestrators); other cells are unaffected. `hela.agent.plan`, `hela.catalog.list`, `hela.catalog.search` and the update tools stay. `/healthz` adds `mode` and `externalOrchestrator`. The variable is read from the runtime's environment, so restart the runtime after changing it.
+`MITOSIS_EXTERNAL_ORCHESTRATOR=<name>` (for example `meta7` or `passive`) hands the control plane to an external coordinator. The runtime hides and refuses `hela.agent.run`, `hela.pipe` and every Mitosis tool outside the [passive allow-list](https://github.com/Hela-Ecosystem/chaining-mcp#passive-mode-external-orchestrators); other cells are unaffected. `hela.agent.plan`, `hela.catalog.list`, `hela.catalog.search` and the update tools stay. `/healthz` adds `mode` and `externalOrchestrator`. The guarantees inside the Mitosis cell (no Needle process, no state or workspace writes, no launched servers) need Mitosis 3.2.0 or later; with an older cell the runtime only filters the surface. The variable is read from the runtime's environment, so restart the runtime after changing it.
 
 ## Respectful Attribution & Metaphor
 

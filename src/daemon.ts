@@ -153,6 +153,8 @@ export class HelaRuntime {
   private manifests!: ManifestStore;
   manifestSources = new Map<string, 'cache' | 'catalog' | 'missing' | 'live'>();
   cellStartupMs = new Map<string, number>();
+  /** Mitosis tool names removed by passive mode, kept only to refuse direct calls to them. */
+  private filteredTools = new Set<string>();
   nativeAgent?: NativeNeedleAgent;
   nativeAgentEnabled = process.env.HELA_NATIVE_AGENT !== 'false';
   nativeAgentReady = false;
@@ -340,9 +342,11 @@ export class HelaRuntime {
    * loopback-only endpoint on an ephemeral port whose path is a random capability, so no other
    * local process can use it without being handed the URL.
    */
-  private cellEnvironment(spec: CellSpec): Promise<Record<string, string> | undefined> {
-    // Passive Mitosis runs no workflows, so it gets no endpoint to call other cells with.
-    if (spec.id !== 'hela-mitosis' || process.env.HELA_RUNTIME_URL || orchestratorMode().passive) return Promise.resolve(undefined);
+  private cellEnvironment(spec: CellSpec): Promise<Record<string, string | undefined> | undefined> {
+    if (spec.id !== 'hela-mitosis') return Promise.resolve(undefined);
+    // Passive Mitosis runs no workflows, so it gets no endpoint to call other cells with, not even an inherited one.
+    if (orchestratorMode().passive) return Promise.resolve({ HELA_RUNTIME_URL: undefined });
+    if (process.env.HELA_RUNTIME_URL) return Promise.resolve(undefined);
     if (!this.internalEndpoint) {
       const secretPath = `/mcp/${randomBytes(16).toString('hex')}`;
       const adapter = new HttpAdapter(() => { const s = this.createServer(); this.attachHandlers(s); return s; }, { port: 0, host: '127.0.0.1', secretPath });
@@ -372,7 +376,11 @@ export class HelaRuntime {
         return;
       }
       // Filtered once here, so listing, routing, pipes, the catalog and the cached manifest all agree.
-      for (const name of [...handle.tools.keys()]) if (!isCellToolAllowed(spec.id, name)) handle.tools.delete(name);
+      for (const name of [...handle.tools.keys()]) {
+        if (isCellToolAllowed(spec.id, name)) continue;
+        handle.tools.delete(name);
+        this.filteredTools.add(name);
+      }
       this.cells.set(handle.key, handle);
       this.logEvent(spec.id, 'start', true);
       this.cellStartupMs.set(spec.id, performance.now() - started);
@@ -448,6 +456,7 @@ export class HelaRuntime {
         this.manifestSources.set(spec.id, manifest.source);
         reasons.set(spec.id, manifest.reason);
         const tools = manifest.tools.filter((tool) => isCellToolAllowed(spec.id, tool.name));
+        for (const tool of manifest.tools) if (!tools.includes(tool)) this.filteredTools.add(tool.name);
         this.cachedManifest[spec.id] = tools;
         const cellShort = spec.id.replace(/^hela-/, '');
         for (const tool of tools) {
@@ -743,6 +752,12 @@ export class HelaRuntime {
     };
   }
 
+  /** The cell a call by this name would reach; the native agent takes a bare `agent_run` before any cell does. */
+  private routedCell(name: string): string | undefined {
+    if (name === 'agent_run' && this.nativeAgentEnabled && this.nativeAgentReady) return undefined;
+    return this.toolToCell.get(name);
+  }
+
   attachHandlers(server: Server): void {
     server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       resources: [{
@@ -942,14 +957,14 @@ export class HelaRuntime {
           },
         });
       }
-      return { tools: tools.filter((tool) => !isRuntimeToolHidden(tool.name)) };
+      return { tools: tools.filter((tool) => !isRuntimeToolHidden(tool.name, this.routedCell(tool.name))) };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const name = req.params.name;
       const args = req.params.arguments ?? {};
       if (this.stopping) return { content: [{ type: 'text', text: 'Runtime is shutting down' }], isError: true };
-      const refusal = passiveRefusal(name, this.toolToCell.get(name));
+      const refusal = passiveRefusal(name, this.routedCell(name), this.filteredTools);
       if (refusal) return { content: [{ type: 'text', text: JSON.stringify(refusal, null, 2) }], isError: true };
 
       if (name === UPDATE_CHECK_TOOL || name === UPDATE_APPLY_TOOL) {

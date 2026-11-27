@@ -8,7 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { HelaRuntime } from '../dist/daemon.js';
 import { buildDigest } from '../dist/manifest.js';
-import { isCellToolAllowed, orchestratorMode, passiveRefusal } from '../dist/orchestrator-mode.js';
+import { isCellToolAllowed, isRuntimeToolHidden, orchestratorMode, passiveRefusal } from '../dist/orchestrator-mode.js';
 
 const fixture = new URL('./fixtures/passive-cell.mjs', import.meta.url);
 const ALLOWED = ['analyze_tools', 'get_current_time', 'validate_tool_chain', 'search_skills', 'llm_query'];
@@ -78,8 +78,14 @@ test('mode resolution and allow-list', () => {
   assert.equal(isCellToolAllowed('hela-mitosis', 'some_future_tool', env), false);
   assert.equal(isCellToolAllowed('hela-membrane', 'brainstorming', env), true);
   assert.equal(isCellToolAllowed('hela-mitosis', 'llm_query', { ...env, CHAINING_LLM_ENABLED: 'false' }), false);
-  assert.equal(passiveRefusal('brainstorming', 'hela-membrane', env), null, 'another cell owns the name');
-  assert.equal(passiveRefusal('hela.pipe', undefined, {}), null);
+  assert.equal(passiveRefusal('brainstorming', 'hela-membrane', new Set(['brainstorming']), env), null, 'another cell owns the name');
+  assert.equal(passiveRefusal('agent_run', 'hela-membrane', new Set(['agent_run']), env), null, 'a cell may own agent_run');
+  assert.equal(isRuntimeToolHidden('agent_run', 'hela-membrane', env), false);
+  assert.equal(isRuntimeToolHidden('agent_run', undefined, env), true);
+  assert.equal(passiveRefusal('hela_mitosis_some_future_tool', undefined, new Set(), env)?.code, 'MITOSIS_PASSIVE_MODE');
+  assert.equal(passiveRefusal('some_future_tool', undefined, new Set(['some_future_tool']), env)?.code, 'MITOSIS_PASSIVE_MODE');
+  assert.equal(passiveRefusal('hela.pipe', undefined, new Set(), {}), null);
+  assert.equal(isCellToolAllowed('hela-mitosis', 'llm_query', { ...env, CHAINING_LLM_ENABLED: ' False ' }), false);
 });
 
 for (const namespaced of [true, false]) {
@@ -96,7 +102,10 @@ for (const namespaced of [true, false]) {
         if (!namespaced && OMITTED.includes(name)) continue;
         assert.ok(!listed.includes(name), `${name} advertised`);
       }
-      const refused = ['hela.agent.run', 'hela.pipe', ...(namespaced ? OMITTED.map((name) => `hela_mitosis_${name}`) : ['agent_run'])];
+      // A bare agent_run reaches the native agent when it is ready, so it is refused then; otherwise
+      // membrane's own tool of that name owns it and stays callable.
+      const refused = ['hela.agent.run', 'hela.pipe', ...(namespaced ? OMITTED.map((name) => `hela_mitosis_${name}`) : needle ? ['agent_run'] : [])];
+      if (!namespaced && !needle) assert.equal((await call('agent_run')).body.ran, 'agent_run');
       for (const name of refused) {
         const result = await call(name, { task: 'x', steps: [{ cell: 'hela-membrane', tool: 'analyze_tools' }] });
         assert.equal(result.isError, true, name);
@@ -133,8 +142,27 @@ test('toggling the variable over one manifest cache always follows the current m
       assert.ok(listed.includes('hela_mitosis_get_current_time'));
     };
     await check('before boot');
+    if (mode) {
+      const early = await call('hela_mitosis_workflow_orchestrator');
+      assert.deepEqual([early.isError, early.body.code], [true, 'MITOSIS_PASSIVE_MODE']);
+    }
     await call('hela_mitosis_get_current_time'); // boots the cell, which saves a live manifest
     await check('after boot');
     await stop();
   }
+});
+
+test('an inherited HELA_RUNTIME_URL is removed, and re-enabled LLM tools return after a passive restart', async (t) => {
+  setEnv(t, { MITOSIS_EXTERNAL_ORCHESTRATOR: 'meta7', CHAINING_LLM_ENABLED: 'false', HELA_RUNTIME_URL: 'http://127.0.0.1:9/mcp', HELA_HTTP_PORT: undefined, FIXTURE_TOOLS: JSON.stringify([...TOOLS, 'some_future_tool']) });
+  const box = sandbox({ needle: false });
+  t.after(() => rmSync(box.root, { recursive: true, force: true }));
+  const first = await start(t, box, true);
+  assert.deepEqual((await first.call('hela_mitosis_get_current_time')).body, { ran: 'get_current_time', runtimeUrl: null });
+  assert.ok(!(await first.names()).includes('hela_mitosis_llm_query'));
+  await first.stop();
+  process.env.CHAINING_LLM_ENABLED = 'true';
+  const second = await start(t, box, true);
+  await second.call('hela_mitosis_get_current_time');
+  assert.ok((await second.names()).includes('hela_mitosis_llm_query'));
+  await second.stop();
 });
